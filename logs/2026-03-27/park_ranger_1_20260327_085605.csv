@@ -1,0 +1,3 @@
+unique_id,channel_name,relative_start,relative_end,local_start_time,local_end_time,duration_seconds,wav_filename
+1,park_ranger_1,00:00:00,00:00:03,08:56:05,08:56:08,3.5,park_ranger_1_20260327_085605.wav
+2,park_ranger_1,00:00:03,00:00:33,08:56:08,08:56:38,30.0,park_ranger_1_20260327_085608.wav

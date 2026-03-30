@@ -1,0 +1,9 @@
+unique_id,channel_name,relative_start,relative_end,local_start_time,local_end_time,duration_seconds,wav_filename
+1,park_ranger_1,00:00:00,00:00:21,16:31:14,16:31:36,21.6,park_ranger_1_20260326_163114.wav
+2,park_ranger_1,00:00:21,00:00:30,16:31:36,16:31:45,9.1,park_ranger_1_20260326_163136.wav
+1,park_ranger_1,00:00:00,00:00:11,16:40:04,16:40:15,11.1,park_ranger_1_20260326_164004.wav
+2,park_ranger_1,00:00:11,00:00:27,16:40:15,16:40:31,16.1,park_ranger_1_20260326_164015.wav
+3,park_ranger_1,00:00:27,00:00:30,16:40:31,16:40:35,3.5,park_ranger_1_20260326_164031.wav
+4,park_ranger_1,00:00:30,00:00:36,16:40:35,16:40:40,5.5,park_ranger_1_20260326_164035.wav
+5,park_ranger_1,00:00:36,00:00:41,16:40:40,16:40:45,5.1,park_ranger_1_20260326_164040.wav
+6,park_ranger_1,00:00:41,00:00:45,16:40:45,16:40:49,4.0,park_ranger_1_20260326_164045.wav
