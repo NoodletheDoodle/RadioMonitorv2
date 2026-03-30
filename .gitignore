@@ -1,2 +1,15 @@
+# generated files
 logs/
 recordings/
+__pycache__/
+*.py[cod]
+
+# configuration files
+config.json
+
+# virtual environment
+venv/
+.venv/
+
+# service files
+*.service
