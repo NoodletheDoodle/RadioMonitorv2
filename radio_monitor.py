@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -37,6 +38,7 @@ Channel = dict[str, Any]
 CSV_COLUMNS = [
     "unique_id",
     "channel_name",
+    "sender_ip",
     "relative_start",
     "relative_end",
     "local_start_time",
@@ -344,6 +346,16 @@ class StreamManager:
 
     def persist_call(self, channel_name: str, call_start_dt: datetime.datetime, staging: str) -> None:
         """Finalize staging WAV into timestamped file and append CSV metadata."""
+        self.persist_call_with_sender(channel_name, call_start_dt, staging, sender_ip="")
+
+    def persist_call_with_sender(
+        self,
+        channel_name: str,
+        call_start_dt: datetime.datetime,
+        staging: str,
+        sender_ip: str,
+    ) -> None:
+        """Finalize staging WAV into timestamped file and append CSV metadata."""
         call_end_dt = datetime.datetime.now()
         duration = (call_end_dt - call_start_dt).total_seconds()
 
@@ -361,6 +373,7 @@ class StreamManager:
             {
                 "unique_id": uid,
                 "channel_name": channel_name,
+                "sender_ip": sender_ip,
                 "relative_start": self.csv_manager.elapsed_str(call_start_dt),
                 "relative_end": self.csv_manager.elapsed_str(call_end_dt),
                 "local_start_time": call_start_dt.strftime("%H:%M:%S"),
@@ -370,71 +383,127 @@ class StreamManager:
             },
         )
 
+    def build_sender_socket(self, channel: Channel) -> socket.socket | None:
+        """Create a nonblocking UDP listener to observe sender IPs on a channel multicast stream."""
+        group_ip = channel["ip"]
+        port = int(channel["port"])
+        iface_ip = self.config_manager.snapshot()["multicast_interface"]
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("0.0.0.0", port))
+            except OSError:
+                # Some platforms require binding directly to group address.
+                sock.bind((group_ip, port))
+
+            mreq = socket.inet_aton(group_ip) + socket.inet_aton(iface_ip)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            sock.setblocking(False)
+            return sock
+        except OSError as exc:
+            print(f"[{channel['name']}] WARNING: sender IP capture disabled ({exc}).")
+            try:
+                sock.close()
+            except OSError:
+                pass
+            return None
+
+    def poll_sender_ip(self, sender_sock: socket.socket | None) -> str | None:
+        """Drain available UDP packets and return the latest observed sender IP."""
+        if sender_sock is None:
+            return None
+
+        latest_ip = None
+        while True:
+            try:
+                _payload, (sender_ip, _sender_port) = sender_sock.recvfrom(4096)
+                latest_ip = sender_ip
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+        return latest_ip
+
     def monitor_channel(self, channel: Channel) -> None:
         """Per-channel loop: record, detect end by file growth, persist call metadata."""
         name = channel["name"]
+        sender_sock = self.build_sender_socket(channel)
 
-        while not self.shutdown_event.is_set() and not self.reload_channels_event.is_set():
-            out_dir = self.recordings_dir(name)
-            os.makedirs(out_dir, exist_ok=True)
-            staging = self.staging_wav_path(name)
-
-            if os.path.exists(staging):
-                os.remove(staging)
-
-            call_start_dt = datetime.datetime.now()
-            try:
-                proc = self.launch_gstreamer(channel, staging)
-            except FileNotFoundError:
-                print(
-                    f"[{name}] ERROR: gst-launch-1.0 not found. "
-                    "Ensure GStreamer is installed and on PATH. Retrying in 5s..."
-                )
-                time.sleep(5)
-                continue
-            except OSError as exc:
-                print(f"[{name}] ERROR launching GStreamer: {exc}. Retrying in 5s...")
-                time.sleep(5)
-                continue
-
-            last_size = 0
-            last_growth_time = time.monotonic()
-            call_had_audio = False
-
+        try:
             while not self.shutdown_event.is_set() and not self.reload_channels_event.is_set():
-                poll_interval = self.config_manager.snapshot()["poll_interval"]
-                time.sleep(poll_interval)
+                out_dir = self.recordings_dir(name)
+                os.makedirs(out_dir, exist_ok=True)
+                staging = self.staging_wav_path(name)
 
-                try:
-                    current_size = os.path.getsize(staging)
-                except FileNotFoundError:
-                    current_size = 0
-
-                if current_size > last_size:
-                    last_size = current_size
-                    last_growth_time = time.monotonic()
-                    call_had_audio = True
-                elif call_had_audio:
-                    silence_duration = time.monotonic() - last_growth_time
-                    threshold = self.config_manager.snapshot()["ptt_end_silence_threshold"]
-                    if silence_duration >= threshold:
-                        break
-
-            self.terminate_gstreamer(proc)
-
-            if self.shutdown_event.is_set() or self.reload_channels_event.is_set():
-                if call_had_audio and os.path.exists(staging) and os.path.getsize(staging) > 0:
-                    self.persist_call(name, call_start_dt, staging)
-                elif os.path.exists(staging):
-                    os.remove(staging)
-                break
-
-            if not call_had_audio or not os.path.exists(staging) or os.path.getsize(staging) == 0:
                 if os.path.exists(staging):
                     os.remove(staging)
-                continue
 
-            self.persist_call(name, call_start_dt, staging)
+                call_start_dt = datetime.datetime.now()
+                call_sender_ip = ""
+                try:
+                    proc = self.launch_gstreamer(channel, staging)
+                except FileNotFoundError:
+                    print(
+                        f"[{name}] ERROR: gst-launch-1.0 not found. "
+                        "Ensure GStreamer is installed and on PATH. Retrying in 5s..."
+                    )
+                    time.sleep(5)
+                    continue
+                except OSError as exc:
+                    print(f"[{name}] ERROR launching GStreamer: {exc}. Retrying in 5s...")
+                    time.sleep(5)
+                    continue
+
+                last_size = 0
+                last_growth_time = time.monotonic()
+                call_had_audio = False
+
+                while not self.shutdown_event.is_set() and not self.reload_channels_event.is_set():
+                    poll_interval = self.config_manager.snapshot()["poll_interval"]
+                    time.sleep(poll_interval)
+
+                    sender_ip = self.poll_sender_ip(sender_sock)
+                    if sender_ip:
+                        call_sender_ip = sender_ip
+
+                    try:
+                        current_size = os.path.getsize(staging)
+                    except FileNotFoundError:
+                        current_size = 0
+
+                    if current_size > last_size:
+                        last_size = current_size
+                        last_growth_time = time.monotonic()
+                        call_had_audio = True
+                    elif call_had_audio:
+                        silence_duration = time.monotonic() - last_growth_time
+                        threshold = self.config_manager.snapshot()["ptt_end_silence_threshold"]
+                        if silence_duration >= threshold:
+                            break
+
+                self.terminate_gstreamer(proc)
+
+                if self.shutdown_event.is_set() or self.reload_channels_event.is_set():
+                    if call_had_audio and os.path.exists(staging) and os.path.getsize(staging) > 0:
+                        self.persist_call_with_sender(name, call_start_dt, staging, call_sender_ip)
+                    elif os.path.exists(staging):
+                        os.remove(staging)
+                    break
+
+                if not call_had_audio or not os.path.exists(staging) or os.path.getsize(staging) == 0:
+                    if os.path.exists(staging):
+                        os.remove(staging)
+                    continue
+
+                self.persist_call_with_sender(name, call_start_dt, staging, call_sender_ip)
+        finally:
+            if sender_sock is not None:
+                try:
+                    sender_sock.close()
+                except OSError:
+                    pass
 
     def check_gstreamer(self) -> None:
         """Verify gst-launch is reachable before channel threads are started."""
@@ -727,8 +796,6 @@ class RadioMonitorApp:
             self.shutdown_event.set()
 
         finally:
-            from pprint import pprint
-            pprint(self.stream_manager.config_manager.snapshot())
             if self.web_server is not None:
                 self.web_server.stop()
             self.stop_channel_threads()
