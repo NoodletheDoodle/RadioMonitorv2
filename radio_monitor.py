@@ -417,6 +417,7 @@ class StreamManager:
         """Build gst-launch command list from current runtime config and channel."""
         return [
             runtime_settings["gstreamer_bin"],
+            "-e",
             "udpsrc",
             f"address={channel['ip']}",
             f"port={channel['port']}",
@@ -787,6 +788,7 @@ class RadioMonitorApp:
 
         self.last_reload_applied_at: str | None = None
         self.last_reload_error: str | None = None
+        self.startup_retry_delay_seconds = 5.0
 
         self.csv_manager = CsvManager(self.config_manager, self.script_start_time)
         self.stream_manager = StreamManager(
@@ -837,8 +839,13 @@ class RadioMonitorApp:
                     f"{script_path.as_posix()} "
                     f"--config {config_path.as_posix()}"
                 ),
-                "Restart=on-failure",
-                "RestartSec=2",
+                "Restart=always",
+                "RestartSec=3",
+                "StartLimitIntervalSec=0",
+                "KillSignal=SIGINT",
+                "TimeoutStopSec=20",
+                "StandardOutput=journal",
+                "StandardError=journal",
                 "",
                 "[Install]",
                 "WantedBy=multi-user.target",
@@ -970,13 +977,19 @@ class RadioMonitorApp:
         if not web_cfg.enabled:
             self.web_server = None
             return
-
-        self.web_server = start_config_server(
-            self.config_manager.config_path,
-            web_cfg,
-            status_provider=self.status_provider,
-        )
-        print(f"  Web UI           : http://{web_cfg.host}:{web_cfg.port}")
+        try:
+            self.web_server = start_config_server(
+                self.config_manager.config_path,
+                web_cfg,
+                status_provider=self.status_provider,
+            )
+            print(f"  Web UI           : http://{web_cfg.host}:{web_cfg.port}")
+        except OSError as exc:
+            self.web_server = None
+            print(
+                f"[Web UI] WARNING: could not start on {web_cfg.host}:{web_cfg.port}: {exc}. "
+                "Continuing without web UI."
+            )
 
     def reload_web_server_if_needed(self, previous_web_cfg: Any) -> None:
         """Apply web server enable/host/port changes after config hot reload."""
@@ -989,21 +1002,43 @@ class RadioMonitorApp:
             self.web_server = None
 
         if new_web_cfg.enabled:
-            self.web_server = start_config_server(
-                self.config_manager.config_path,
-                new_web_cfg,
-                status_provider=self.status_provider,
-            )
+            try:
+                self.web_server = start_config_server(
+                    self.config_manager.config_path,
+                    new_web_cfg,
+                    status_provider=self.status_provider,
+                )
+            except OSError as exc:
+                self.web_server = None
+                print(
+                    f"[Web UI] WARNING: reload could not bind {new_web_cfg.host}:{new_web_cfg.port}: {exc}. "
+                    "Web UI remains disabled."
+                )
 
     def run(self) -> int:
         """Run the main service loop with hot-reload and graceful shutdown."""
         signal.signal(signal.SIGTERM, self.handle_shutdown)
         signal.signal(signal.SIGINT, self.handle_shutdown)
 
-        self.config_manager.load_and_apply_from_disk()
+        startup_attempt = 0
+        while not self.shutdown_event.is_set():
+            startup_attempt += 1
+            try:
+                self.config_manager.load_and_apply_from_disk()
+                self.stream_manager.check_gstreamer()
+                break
+            except Exception as exc:
+                print(
+                    f"[Startup] Attempt {startup_attempt} failed: {exc}. "
+                    f"Retrying in {self.startup_retry_delay_seconds:.0f}s..."
+                )
+                time.sleep(self.startup_retry_delay_seconds)
+
+        if self.shutdown_event.is_set():
+            print("[Shutdown] Startup aborted due to shutdown request.")
+            return 0
 
         self.print_startup_info()
-        self.stream_manager.check_gstreamer()
 
         self.start_channel_threads()
         self.start_web_server()
