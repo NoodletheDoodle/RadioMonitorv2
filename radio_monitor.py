@@ -51,21 +51,34 @@ CSV_COLUMNS = [
 class ConfigManager:
     """Handles config loading, validation, defaults, and runtime config state."""
 
+    DEFAULT_CHANNELS = [
+        {"name": "park_ranger_1", "ip": "239.192.49.1", "port": 60322},
+        # {"name": "park_ranger_2", "ip": "239.192.49.3", "port": 60326},
+    ]
+    DEFAULT_WEB_UI = {
+        "enabled": True,
+        "host": "0.0.0.0",
+        "port": 12345,
+    }
+    DEFAULT_RECORDINGS_BASE = "./recordings"
+    DEFAULT_LOGS_BASE = "./logs"
+    DEFAULT_SILENCE_THRESHOLD = 2.0
+    DEFAULT_POLL_INTERVAL = 0.5
+    DEFAULT_GSTREAMER_BIN = "gst-launch-1.0"
+    DEFAULT_WINDOWS_MCAST_IFACE_IP = "10.3.1.253"
+
     def __init__(self, config_path: Path) -> None:
         self.config_path = config_path
         self.lock = threading.Lock()
 
-        # Defaults match previous behavior.
-        self.channels = [
-            {"name": "park_ranger_1", "ip": "239.192.49.1", "port": 60322},
-            # {"name": "park_ranger_2", "ip": "239.192.49.3", "port": 60326},
-        ]
-        self.multicast_interface = "10.3.1.253"
-        self.ptt_end_silence_threshold = 2.0
-        self.poll_interval = 0.5
-        self.gstreamer_bin = self.resolve_gstreamer_bin("gst-launch-1.0")
-        self.recordings_base = "./recordings"
-        self.logs_base = "./logs"
+        defaults = self.default_config_dict()
+        self.channels = self.validate_channels(defaults["channels"])
+        self.multicast_interface = str(defaults["multicast_interface"])
+        self.ptt_end_silence_threshold = float(defaults["ptt_end_silence_threshold"])
+        self.poll_interval = float(defaults["poll_interval"])
+        self.gstreamer_bin = str(defaults["gstreamer_bin"])
+        self.recordings_base = str(defaults["recordings_base"])
+        self.logs_base = str(defaults["logs_base"])
         self.web_cfg = parse_web_ui_config({})
 
     def _get_windows_mcast_iface(self) -> str | None:
@@ -121,7 +134,7 @@ class ConfigManager:
                 return (
                     iface
                     if (iface := self._get_windows_mcast_iface())
-                    else "10.3.1.253"
+                    else self.DEFAULT_WINDOWS_MCAST_IFACE_IP
                 )
             case p if p.startswith("linux"):
                 return iface if (iface := self._get_linux_mcast_iface()) else "eth0"
@@ -131,27 +144,20 @@ class ConfigManager:
                 print(
                     "WARNING: Unrecognized platform. Defaulting to multicast interface IP"
                 )
-                return "10.3.1.253"
+                return self.DEFAULT_WINDOWS_MCAST_IFACE_IP
 
     def default_config_dict(self) -> dict[str, Any]:
         """Return a starter config payload that matches existing defaults."""
 
         return {
             "multicast_interface": self._get_platform_mcast_iface(),
-            "gstreamer_bin": self.resolve_gstreamer_bin("gst-launch-1.0"),
-            "recordings_base": "./recordings",
-            "logs_base": "./logs",
-            "ptt_end_silence_threshold": 2.0,
-            "poll_interval": 0.5,
-            "web_ui": {
-                "enabled": True,
-                "host": "0.0.0.0",
-                "port": 12345,
-            },
-            "channels": [
-                {"name": "park_ranger_1", "ip": "239.192.49.1", "port": 60322},
-                # {"name": "park_ranger_2", "ip": "239.192.49.3", "port": 60326},
-            ],
+            "gstreamer_bin": self.resolve_gstreamer_bin(self.DEFAULT_GSTREAMER_BIN),
+            "recordings_base": self.DEFAULT_RECORDINGS_BASE,
+            "logs_base": self.DEFAULT_LOGS_BASE,
+            "ptt_end_silence_threshold": self.DEFAULT_SILENCE_THRESHOLD,
+            "poll_interval": self.DEFAULT_POLL_INTERVAL,
+            "web_ui": dict(self.DEFAULT_WEB_UI),
+            "channels": [dict(channel) for channel in self.DEFAULT_CHANNELS],
         }
 
     def init_default_config(self) -> int:
@@ -229,9 +235,9 @@ class ConfigManager:
             f"GStreamer binary '{gstreamer_bin}' not found in PATH and is not an executable file."
         )
 
-    def apply_config(self, raw_config: dict[str, Any]) -> None:
-        """Validate and apply runtime settings from config payload."""
-        channels = self.validate_channels(raw_config.get("channels", []))
+    def normalize_config(self, raw_config: dict[str, Any]) -> dict[str, Any]:
+        """Return validated and normalized runtime settings from raw config payload."""
+        channels = self.validate_channels(raw_config.get("channels", self.channels))
         multicast_interface = str(
             raw_config.get("multicast_interface", self.multicast_interface)
         ).strip()
@@ -260,26 +266,43 @@ class ConfigManager:
         if poll_interval <= 0:
             raise ValueError("'poll_interval' must be > 0.")
 
+        return {
+            "channels": channels,
+            "multicast_interface": multicast_interface,
+            "gstreamer_bin": gstreamer_bin,
+            "recordings_base": recordings_base,
+            "logs_base": logs_base,
+            "ptt_end_silence_threshold": silence_threshold,
+            "poll_interval": poll_interval,
+            "web_cfg": parse_web_ui_config(raw_config),
+        }
+
+    def apply_normalized_config(self, normalized: dict[str, Any]) -> None:
+        """Apply already-normalized runtime settings."""
         with self.lock:
-            self.channels = channels
-            self.multicast_interface = multicast_interface
-            self.gstreamer_bin = gstreamer_bin
-            self.recordings_base = recordings_base
-            self.logs_base = logs_base
-            self.ptt_end_silence_threshold = silence_threshold
-            self.poll_interval = poll_interval
-            self.web_cfg = parse_web_ui_config(raw_config)
+            self.channels = [dict(ch) for ch in normalized["channels"]]
+            self.multicast_interface = str(normalized["multicast_interface"])
+            self.gstreamer_bin = str(normalized["gstreamer_bin"])
+            self.recordings_base = str(normalized["recordings_base"])
+            self.logs_base = str(normalized["logs_base"])
+            self.ptt_end_silence_threshold = float(
+                normalized["ptt_end_silence_threshold"]
+            )
+            self.poll_interval = float(normalized["poll_interval"])
+            self.web_cfg = normalized["web_cfg"]
+
+    def apply_config(self, raw_config: dict[str, Any]) -> None:
+        """Validate and apply runtime settings from config payload."""
+        self.apply_normalized_config(self.normalize_config(raw_config))
 
     def load_and_apply_from_disk(self) -> None:
         """Reload config from disk and apply it to current runtime state."""
         raw_config = self.read_config()
-        resolved_bin = self.resolve_gstreamer_bin(
-            str(raw_config.get("gstreamer_bin", self.gstreamer_bin))
-        )
-        if raw_config.get("gstreamer_bin") != resolved_bin:
-            raw_config["gstreamer_bin"] = resolved_bin
+        normalized = self.normalize_config(raw_config)
+        if raw_config.get("gstreamer_bin") != normalized["gstreamer_bin"]:
+            raw_config["gstreamer_bin"] = normalized["gstreamer_bin"]
             self.write_config(raw_config)
-        self.apply_config(raw_config)
+        self.apply_normalized_config(normalized)
 
     def snapshot(self) -> dict[str, Any]:
         """Return a copy of current runtime config values for thread-safe reads."""
@@ -351,39 +374,55 @@ class StreamManager:
         self.call_counter_lock = call_counter_lock
         self.call_counters = call_counters
 
-    def recordings_dir(self, channel_name: str) -> str:
+    def recordings_dir(self, channel_name: str, recordings_base: str | None = None) -> str:
         """Return per-channel output folder for today's date."""
-        base = self.config_manager.snapshot()["recordings_base"]
+        base = (
+            recordings_base
+            if recordings_base is not None
+            else self.config_manager.snapshot()["recordings_base"]
+        )
         return os.path.join(
             base, datetime.date.today().strftime("%Y-%m-%d"), channel_name
         )
 
-    def staging_wav_path(self, channel_name: str) -> str:
+    def staging_wav_path(
+        self, channel_name: str, recordings_base: str | None = None
+    ) -> str:
         """Return temporary WAV output path used while a call is active."""
         return os.path.join(
-            self.recordings_dir(channel_name), f"staging_{channel_name}.wav"
+            self.recordings_dir(channel_name, recordings_base),
+            f"staging_{channel_name}.wav",
         )
 
     def final_wav_path(
-        self, channel_name: str, start_dt: datetime.datetime
+        self,
+        channel_name: str,
+        start_dt: datetime.datetime,
+        recordings_base: str | None = None,
     ) -> tuple[str, str]:
         """Return final WAV path and filename for a completed call."""
         timestamp = start_dt.strftime("%Y%m%d_%H%M%S")
         filename = f"{channel_name}_{timestamp}.wav"
-        return os.path.join(self.recordings_dir(channel_name), filename), filename
+        return (
+            os.path.join(self.recordings_dir(channel_name, recordings_base), filename),
+            filename,
+        )
 
-    def build_gst_command(self, channel: Channel, output_path: str) -> list[str]:
+    def build_gst_command(
+        self,
+        channel: Channel,
+        output_path: str,
+        runtime_settings: dict[str, Any],
+    ) -> list[str]:
         """Build gst-launch command list from current runtime config and channel."""
-        snap = self.config_manager.snapshot()
-
         return [
-            snap["gstreamer_bin"],
+            runtime_settings["gstreamer_bin"],
             "udpsrc",
             f"address={channel['ip']}",
             f"port={channel['port']}",
             "auto-multicast=true",
-            f"multicast-iface={snap['multicast_interface']}",
-            "caps=application/x-rtp, media=audio, encoding-name=OPUS, payload=112",
+            f"multicast-iface={runtime_settings['multicast_interface']}",
+            "caps=application/x-rtp,media=audio,encoding-name=OPUS,payload=112",
             "!",
             "queue",
             "!",
@@ -405,23 +444,15 @@ class StreamManager:
             f"location={output_path.replace(os.sep, '/')}",
         ]
 
-    def _detect_platform(self) -> str:
-        """Detect the current platform for potential platform-specific handling."""
-        if sys.platform.lower().startswith("win"):
-            return "windows"
-        elif sys.platform.lower().startswith("linux"):
-            return "linux"
-        elif sys.platform.lower().startswith("darwin"):
-            return "macos"
-        else:
-            return "unknown"
-
     def launch_gstreamer(
-        self, channel: Channel, output_path: str
+        self,
+        channel: Channel,
+        output_path: str,
+        runtime_settings: dict[str, Any],
     ) -> subprocess.Popen[Any]:
         """Launch gst-launch process that writes audio to output_path."""
         return subprocess.Popen(
-            self.build_gst_command(channel, output_path),
+            self.build_gst_command(channel, output_path, runtime_settings),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -437,26 +468,21 @@ class StreamManager:
             proc.kill()
             proc.wait()
 
-    def persist_call(
-        self, channel_name: str, call_start_dt: datetime.datetime, staging: str
-    ) -> None:
-        """Finalize staging WAV into timestamped file and append CSV metadata."""
-        self.persist_call_with_sender(
-            channel_name, call_start_dt, staging, sender_ip=""
-        )
-
     def persist_call_with_sender(
         self,
         channel_name: str,
         call_start_dt: datetime.datetime,
         staging: str,
-        sender_ip: str,
+        sender_ip: str = "",
+        recordings_base: str | None = None,
     ) -> None:
         """Finalize staging WAV into timestamped file and append CSV metadata."""
         call_end_dt = datetime.datetime.now()
         duration = (call_end_dt - call_start_dt).total_seconds()
 
-        final_path, wav_filename = self.final_wav_path(channel_name, call_start_dt)
+        final_path, wav_filename = self.final_wav_path(
+            channel_name, call_start_dt, recordings_base
+        )
         out_dir = os.path.dirname(final_path)
         os.makedirs(out_dir, exist_ok=True)
         os.rename(staging, final_path)
@@ -509,6 +535,26 @@ class StreamManager:
                 pass
             return None
 
+    def ensure_sender_socket(
+        self,
+        channel: Channel,
+        sender_sock: socket.socket | None,
+        next_retry_at: float,
+    ) -> tuple[socket.socket | None, float]:
+        """Return a live sender socket when possible, retrying on a backoff timer."""
+        if sender_sock is not None:
+            return sender_sock, next_retry_at
+
+        now = time.monotonic()
+        if now < next_retry_at:
+            return None, next_retry_at
+
+        sender_sock = self.build_sender_socket(channel)
+        if sender_sock is None:
+            # Keep retrying if network/interface state recovers later.
+            return None, now + 5.0
+        return sender_sock, now
+
     def poll_sender_ip(self, sender_sock: socket.socket | None) -> str | None:
         """Drain available UDP packets and return the latest observed sender IP."""
         if sender_sock is None:
@@ -525,100 +571,173 @@ class StreamManager:
                 break
         return latest_ip
 
+    def prepare_staging_file(self, channel_name: str, recordings_base: str) -> str:
+        """Ensure channel output directory exists and staging file starts clean."""
+        out_dir = self.recordings_dir(channel_name, recordings_base)
+        os.makedirs(out_dir, exist_ok=True)
+        staging = self.staging_wav_path(channel_name, recordings_base)
+        if os.path.exists(staging):
+            os.remove(staging)
+        return staging
+
+    def start_call_process(
+        self,
+        channel: Channel,
+        channel_name: str,
+        staging: str,
+        runtime_settings: dict[str, Any],
+    ) -> subprocess.Popen[Any] | None:
+        """Start GStreamer recording process, returning None when startup fails."""
+        try:
+            return self.launch_gstreamer(channel, staging, runtime_settings)
+        except FileNotFoundError:
+            print(
+                f"[{channel_name}] ERROR: gst-launch-1.0 not found. "
+                "Ensure GStreamer is installed and on PATH. Retrying in 5s..."
+            )
+            time.sleep(5)
+            return None
+        except OSError as exc:
+            print(
+                f"[{channel_name}] ERROR launching GStreamer: {exc}. Retrying in 5s..."
+            )
+            time.sleep(5)
+            return None
+
+    def monitor_call_activity(
+        self,
+        staging: str,
+        sender_sock: socket.socket | None,
+    ) -> tuple[bool, str]:
+        """Track growth/silence to detect call boundaries and latest sender IP."""
+        last_size = 0
+        last_growth_time = time.monotonic()
+        call_had_audio = False
+        call_sender_ip = ""
+
+        while (
+            not self.shutdown_event.is_set()
+            and not self.reload_channels_event.is_set()
+        ):
+            snap = self.config_manager.snapshot()
+            poll_interval = snap["poll_interval"]
+            silence_threshold = snap["ptt_end_silence_threshold"]
+            time.sleep(poll_interval)
+
+            sender_ip = self.poll_sender_ip(sender_sock)
+            if sender_ip:
+                call_sender_ip = sender_ip
+
+            try:
+                current_size = os.path.getsize(staging)
+            except FileNotFoundError:
+                current_size = 0
+
+            if current_size > last_size:
+                last_size = current_size
+                last_growth_time = time.monotonic()
+                call_had_audio = True
+            elif call_had_audio:
+                silence_duration = time.monotonic() - last_growth_time
+                if silence_duration >= silence_threshold:
+                    break
+
+        return call_had_audio, call_sender_ip
+
+    def finalize_or_discard_call(
+        self,
+        channel_name: str,
+        call_start_dt: datetime.datetime,
+        staging: str,
+        call_had_audio: bool,
+        sender_ip: str,
+        recordings_base: str,
+    ) -> None:
+        """Persist valid call audio and metadata, otherwise remove staging file."""
+        if (
+            not call_had_audio
+            or not os.path.exists(staging)
+            or os.path.getsize(staging) == 0
+        ):
+            if os.path.exists(staging):
+                os.remove(staging)
+            return
+
+        self.persist_call_with_sender(
+            channel_name,
+            call_start_dt,
+            staging,
+            sender_ip=sender_ip,
+            recordings_base=recordings_base,
+        )
+
     def monitor_channel(self, channel: Channel) -> None:
         """Per-channel loop: record, detect end by file growth, persist call metadata."""
         name = channel["name"]
-        sender_sock = self.build_sender_socket(channel)
+        sender_sock: socket.socket | None = None
+        next_sender_sock_retry_at = 0.0
 
         try:
             while (
                 not self.shutdown_event.is_set()
                 and not self.reload_channels_event.is_set()
             ):
-                out_dir = self.recordings_dir(name)
-                os.makedirs(out_dir, exist_ok=True)
-                staging = self.staging_wav_path(name)
-
-                if os.path.exists(staging):
-                    os.remove(staging)
-
-                call_start_dt = datetime.datetime.now()
-                call_sender_ip = ""
                 try:
-                    proc = self.launch_gstreamer(channel, staging)
-                except FileNotFoundError:
-                    print(
-                        f"[{name}] ERROR: gst-launch-1.0 not found. "
-                        "Ensure GStreamer is installed and on PATH. Retrying in 5s..."
+                    sender_sock, next_sender_sock_retry_at = self.ensure_sender_socket(
+                        channel, sender_sock, next_sender_sock_retry_at
                     )
-                    time.sleep(5)
-                    continue
-                except OSError as exc:
-                    print(
-                        f"[{name}] ERROR launching GStreamer: {exc}. Retrying in 5s..."
+
+                    runtime_settings = self.config_manager.snapshot()
+                    recordings_base = runtime_settings["recordings_base"]
+                    staging = self.prepare_staging_file(name, recordings_base)
+
+                    call_start_dt = datetime.datetime.now()
+                    proc = self.start_call_process(
+                        channel,
+                        name,
+                        staging,
+                        runtime_settings,
                     )
-                    time.sleep(5)
-                    continue
+                    if proc is None:
+                        continue
 
-                last_size = 0
-                last_growth_time = time.monotonic()
-                call_had_audio = False
+                    call_had_audio, call_sender_ip = self.monitor_call_activity(
+                        staging,
+                        sender_sock,
+                    )
 
-                while (
-                    not self.shutdown_event.is_set()
-                    and not self.reload_channels_event.is_set()
-                ):
-                    poll_interval = self.config_manager.snapshot()["poll_interval"]
-                    time.sleep(poll_interval)
+                    self.terminate_gstreamer(proc)
 
-                    sender_ip = self.poll_sender_ip(sender_sock)
-                    if sender_ip:
-                        call_sender_ip = sender_ip
-
-                    try:
-                        current_size = os.path.getsize(staging)
-                    except FileNotFoundError:
-                        current_size = 0
-
-                    if current_size > last_size:
-                        last_size = current_size
-                        last_growth_time = time.monotonic()
-                        call_had_audio = True
-                    elif call_had_audio:
-                        silence_duration = time.monotonic() - last_growth_time
-                        threshold = self.config_manager.snapshot()[
-                            "ptt_end_silence_threshold"
-                        ]
-                        if silence_duration >= threshold:
-                            break
-
-                self.terminate_gstreamer(proc)
-
-                if self.shutdown_event.is_set() or self.reload_channels_event.is_set():
-                    if (
-                        call_had_audio
-                        and os.path.exists(staging)
-                        and os.path.getsize(staging) > 0
-                    ):
-                        self.persist_call_with_sender(
-                            name, call_start_dt, staging, call_sender_ip
+                    if self.shutdown_event.is_set() or self.reload_channels_event.is_set():
+                        self.finalize_or_discard_call(
+                            name,
+                            call_start_dt,
+                            staging,
+                            call_had_audio,
+                            call_sender_ip,
+                            recordings_base,
                         )
-                    elif os.path.exists(staging):
-                        os.remove(staging)
-                    break
+                        break
 
-                if (
-                    not call_had_audio
-                    or not os.path.exists(staging)
-                    or os.path.getsize(staging) == 0
-                ):
-                    if os.path.exists(staging):
-                        os.remove(staging)
-                    continue
-
-                self.persist_call_with_sender(
-                    name, call_start_dt, staging, call_sender_ip
-                )
+                    self.finalize_or_discard_call(
+                        name,
+                        call_start_dt,
+                        staging,
+                        call_had_audio,
+                        call_sender_ip,
+                        recordings_base,
+                    )
+                except Exception as exc:
+                    # Keep monitor threads alive across transient socket/interface failures.
+                    print(f"[{name}] WARNING: monitor loop recovered from error: {exc}")
+                    if sender_sock is not None:
+                        try:
+                            sender_sock.close()
+                        except OSError:
+                            pass
+                        sender_sock = None
+                    next_sender_sock_retry_at = time.monotonic() + 5.0
+                    time.sleep(1)
         finally:
             if sender_sock is not None:
                 try:
@@ -776,26 +895,35 @@ class RadioMonitorApp:
         with self.state_lock:
             self.threads = threads
 
-    def restart_channel_threads(self) -> None:
-        """Restart all monitor threads after channel list changes."""
-        self.reload_channels_event.set()
+    def join_channel_threads(self, timeout: float = 10.0) -> None:
+        """Join all current monitor threads using the given timeout."""
         with self.state_lock:
             old_threads = list(self.threads)
 
         for t in old_threads:
-            t.join(timeout=10)
+            t.join(timeout=timeout)
 
+    def request_stop_channel_threads(self) -> None:
+        """Signal monitor threads to stop and wait briefly for cleanup."""
+        self.reload_channels_event.set()
+        self.join_channel_threads()
+
+    def restart_channel_threads(self) -> None:
+        """Restart all monitor threads after channel list changes."""
+        self.request_stop_channel_threads()
         self.reload_channels_event.clear()
         self.start_channel_threads()
 
     def stop_channel_threads(self) -> None:
         """Stop monitor threads and wait briefly for cleanup."""
-        self.reload_channels_event.set()
-        with self.state_lock:
-            old_threads = list(self.threads)
+        self.request_stop_channel_threads()
 
-        for t in old_threads:
-            t.join(timeout=10)
+    def has_dead_channel_threads(self) -> bool:
+        """Return True if any monitor thread exited unexpectedly."""
+        with self.state_lock:
+            if not self.threads:
+                return False
+            return any(not t.is_alive() for t in self.threads)
 
     def status_provider(self) -> dict[str, Any]:
         """Build read-only runtime status payload for web UI endpoint."""
@@ -893,10 +1021,16 @@ class RadioMonitorApp:
                 next_reload_check = now_mono + 1.0
                 current_mtime = self.config_manager.config_mtime_ns()
                 if current_mtime == last_config_mtime:
+                    if self.has_dead_channel_threads():
+                        print(
+                            "[Health] One or more channel monitor threads stopped unexpectedly. Restarting..."
+                        )
+                        self.restart_channel_threads()
                     continue
 
-                previous_channels = self.config_manager.snapshot()["channels"]
-                previous_web_cfg = self.config_manager.snapshot()["web_cfg"]
+                previous_snap = self.config_manager.snapshot()
+                previous_channels = previous_snap["channels"]
+                previous_web_cfg = previous_snap["web_cfg"]
 
                 try:
                     self.config_manager.load_and_apply_from_disk()
@@ -909,7 +1043,8 @@ class RadioMonitorApp:
                         self.last_reload_error = str(exc)
                     continue
 
-                if self.config_manager.snapshot()["channels"] != previous_channels:
+                current_channels = self.config_manager.snapshot()["channels"]
+                if current_channels != previous_channels:
                     print(
                         "[Config] Channel list changed. Restarting channel monitor threads..."
                     )
