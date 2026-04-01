@@ -58,7 +58,7 @@ class ConfigManager:
         # Defaults match previous behavior.
         self.channels = [
             {"name": "park_ranger_1", "ip": "239.192.49.1", "port": 60322},
-            {"name": "park_ranger_2", "ip": "239.192.49.3", "port": 60326},
+            # {"name": "park_ranger_2", "ip": "239.192.49.3", "port": 60326},
         ]
         self.multicast_interface = "10.3.1.253"
         self.ptt_end_silence_threshold = 2.0
@@ -68,14 +68,77 @@ class ConfigManager:
         self.logs_base = "./logs"
         self.web_cfg = parse_web_ui_config({})
 
+    def _get_windows_mcast_iface(self) -> str | None:
+        """Attempt to find a reasonable default multicast interface IP on Windows.
+        Returns an IP address instead of an interface name, since windows multicast
+        configs typically expect an IP instead of an interface name."""
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces",
+            ) as key:
+                for i in range(winreg.QueryInfoKey(key)[0]):
+                    subkey_name = winreg.EnumKey(key, i)
+                    with winreg.OpenKey(key, subkey_name) as subkey:
+                        try:
+                            ip_addr = winreg.QueryValueEx(subkey, "DhcpIPAddress")[0]
+                            if ip_addr and ip_addr.startswith("10."):
+                                return ip_addr
+                        except FileNotFoundError:
+                            continue
+        except Exception as exc:
+            print(f"WARNING: Failed to detect Windows multicast interface IP: {exc}")
+        return None
+
+    def _get_linux_mcast_iface(self) -> str | None:
+        """Attempt to find a reasonable default multicast interface IP on Linux.
+        Returns the interface, rather than the IP, since linux multicast configs typically
+        expect an interface name instead of an IP address."""
+        try:
+            import netifaces
+
+            for iface in netifaces.interfaces():
+                addrs = netifaces.ifaddresses(iface)
+                if netifaces.AF_INET in addrs:
+                    for addr_info in addrs[netifaces.AF_INET]:
+                        ip_addr = addr_info.get("addr")
+                        if ip_addr and ip_addr.startswith("10."):
+                            return iface
+        except ImportError:
+            print(
+                "WARNING: netifaces library not found, skipping Linux multicast interface auto-detection."
+            )
+        except Exception as exc:
+            print(f"WARNING: Failed to detect Linux multicast interface IP: {exc}")
+        return None
+
+    def _get_platform_mcast_iface(self) -> str:
+        """Return a reasonable default multicast interface IP based on platform heuristics."""
+        match sys.platform.lower():
+            case p if p.startswith("win"):
+                return (
+                    iface
+                    if (iface := self._get_windows_mcast_iface())
+                    else "10.3.1.253"
+                )
+            case p if p.startswith("linux"):
+                return iface if (iface := self._get_linux_mcast_iface()) else "eth0"
+            case p if p.startswith("darwin"):
+                return "en0"
+            case _:
+                print(
+                    "WARNING: Unrecognized platform. Defaulting to multicast interface IP"
+                )
+                return "10.3.1.253"
+
     def default_config_dict(self) -> dict[str, Any]:
         """Return a starter config payload that matches existing defaults."""
 
-        gst_bin = self.resolve_gstreamer_bin("gst-launch-1.0")
-
         return {
-            "multicast_interface": "10.3.1.253",
-            "gstreamer_bin": gst_bin,
+            "multicast_interface": self._get_platform_mcast_iface(),
+            "gstreamer_bin": self.resolve_gstreamer_bin("gst-launch-1.0"),
             "recordings_base": "./recordings",
             "logs_base": "./logs",
             "ptt_end_silence_threshold": 2.0,
@@ -87,7 +150,7 @@ class ConfigManager:
             },
             "channels": [
                 {"name": "park_ranger_1", "ip": "239.192.49.1", "port": 60322},
-                {"name": "park_ranger_2", "ip": "239.192.49.3", "port": 60326},
+                # {"name": "park_ranger_2", "ip": "239.192.49.3", "port": 60326},
             ],
         }
 
@@ -107,7 +170,9 @@ class ConfigManager:
     def write_config(self, raw_config: dict[str, Any]) -> None:
         """Persist config JSON in a human-readable format."""
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        self.config_path.write_text(json.dumps(raw_config, indent=2) + "\n", encoding="utf-8")
+        self.config_path.write_text(
+            json.dumps(raw_config, indent=2) + "\n", encoding="utf-8"
+        )
 
     def config_mtime_ns(self) -> int:
         """Return mtime in ns for hot reload checks, or -1 if file is missing."""
@@ -160,16 +225,22 @@ class ConfigManager:
         if fp:
             print(f"  GStreamer binary : {fp} (found on PATH)")
             return str(Path(fp).resolve())
-        raise ValueError(f"GStreamer binary '{gstreamer_bin}' not found in PATH and is not an executable file.")
+        raise ValueError(
+            f"GStreamer binary '{gstreamer_bin}' not found in PATH and is not an executable file."
+        )
 
     def apply_config(self, raw_config: dict[str, Any]) -> None:
         """Validate and apply runtime settings from config payload."""
         channels = self.validate_channels(raw_config.get("channels", []))
-        multicast_interface = str(raw_config.get("multicast_interface", self.multicast_interface)).strip()
+        multicast_interface = str(
+            raw_config.get("multicast_interface", self.multicast_interface)
+        ).strip()
         gstreamer_bin = self.resolve_gstreamer_bin(
             str(raw_config.get("gstreamer_bin", self.gstreamer_bin))
         )
-        recordings_base = str(raw_config.get("recordings_base", self.recordings_base)).strip()
+        recordings_base = str(
+            raw_config.get("recordings_base", self.recordings_base)
+        ).strip()
         logs_base = str(raw_config.get("logs_base", self.logs_base)).strip()
         silence_threshold = float(
             raw_config.get("ptt_end_silence_threshold", self.ptt_end_silence_threshold)
@@ -228,7 +299,9 @@ class ConfigManager:
 class CsvManager:
     """Handles all CSV pathing and writing behavior."""
 
-    def __init__(self, config_manager: ConfigManager, script_start_time: datetime.datetime) -> None:
+    def __init__(
+        self, config_manager: ConfigManager, script_start_time: datetime.datetime
+    ) -> None:
         self.config_manager = config_manager
         self.script_start_time = script_start_time
 
@@ -281,13 +354,19 @@ class StreamManager:
     def recordings_dir(self, channel_name: str) -> str:
         """Return per-channel output folder for today's date."""
         base = self.config_manager.snapshot()["recordings_base"]
-        return os.path.join(base, datetime.date.today().strftime("%Y-%m-%d"), channel_name)
+        return os.path.join(
+            base, datetime.date.today().strftime("%Y-%m-%d"), channel_name
+        )
 
     def staging_wav_path(self, channel_name: str) -> str:
         """Return temporary WAV output path used while a call is active."""
-        return os.path.join(self.recordings_dir(channel_name), f"staging_{channel_name}.wav")
+        return os.path.join(
+            self.recordings_dir(channel_name), f"staging_{channel_name}.wav"
+        )
 
-    def final_wav_path(self, channel_name: str, start_dt: datetime.datetime) -> tuple[str, str]:
+    def final_wav_path(
+        self, channel_name: str, start_dt: datetime.datetime
+    ) -> tuple[str, str]:
         """Return final WAV path and filename for a completed call."""
         timestamp = start_dt.strftime("%Y%m%d_%H%M%S")
         filename = f"{channel_name}_{timestamp}.wav"
@@ -296,6 +375,7 @@ class StreamManager:
     def build_gst_command(self, channel: Channel, output_path: str) -> list[str]:
         """Build gst-launch command list from current runtime config and channel."""
         snap = self.config_manager.snapshot()
+
         return [
             snap["gstreamer_bin"],
             "udpsrc",
@@ -325,7 +405,20 @@ class StreamManager:
             f"location={output_path.replace(os.sep, '/')}",
         ]
 
-    def launch_gstreamer(self, channel: Channel, output_path: str) -> subprocess.Popen[Any]:
+    def _detect_platform(self) -> str:
+        """Detect the current platform for potential platform-specific handling."""
+        if sys.platform.lower().startswith("win"):
+            return "windows"
+        elif sys.platform.lower().startswith("linux"):
+            return "linux"
+        elif sys.platform.lower().startswith("darwin"):
+            return "macos"
+        else:
+            return "unknown"
+
+    def launch_gstreamer(
+        self, channel: Channel, output_path: str
+    ) -> subprocess.Popen[Any]:
         """Launch gst-launch process that writes audio to output_path."""
         return subprocess.Popen(
             self.build_gst_command(channel, output_path),
@@ -344,9 +437,13 @@ class StreamManager:
             proc.kill()
             proc.wait()
 
-    def persist_call(self, channel_name: str, call_start_dt: datetime.datetime, staging: str) -> None:
+    def persist_call(
+        self, channel_name: str, call_start_dt: datetime.datetime, staging: str
+    ) -> None:
         """Finalize staging WAV into timestamped file and append CSV metadata."""
-        self.persist_call_with_sender(channel_name, call_start_dt, staging, sender_ip="")
+        self.persist_call_with_sender(
+            channel_name, call_start_dt, staging, sender_ip=""
+        )
 
     def persist_call_with_sender(
         self,
@@ -365,7 +462,9 @@ class StreamManager:
         os.rename(staging, final_path)
 
         with self.call_counter_lock:
-            self.call_counters[channel_name] = self.call_counters.get(channel_name, 0) + 1
+            self.call_counters[channel_name] = (
+                self.call_counters.get(channel_name, 0) + 1
+            )
             uid = self.call_counters[channel_name]
 
         self.csv_manager.write_row(
@@ -432,7 +531,10 @@ class StreamManager:
         sender_sock = self.build_sender_socket(channel)
 
         try:
-            while not self.shutdown_event.is_set() and not self.reload_channels_event.is_set():
+            while (
+                not self.shutdown_event.is_set()
+                and not self.reload_channels_event.is_set()
+            ):
                 out_dir = self.recordings_dir(name)
                 os.makedirs(out_dir, exist_ok=True)
                 staging = self.staging_wav_path(name)
@@ -452,7 +554,9 @@ class StreamManager:
                     time.sleep(5)
                     continue
                 except OSError as exc:
-                    print(f"[{name}] ERROR launching GStreamer: {exc}. Retrying in 5s...")
+                    print(
+                        f"[{name}] ERROR launching GStreamer: {exc}. Retrying in 5s..."
+                    )
                     time.sleep(5)
                     continue
 
@@ -460,7 +564,10 @@ class StreamManager:
                 last_growth_time = time.monotonic()
                 call_had_audio = False
 
-                while not self.shutdown_event.is_set() and not self.reload_channels_event.is_set():
+                while (
+                    not self.shutdown_event.is_set()
+                    and not self.reload_channels_event.is_set()
+                ):
                     poll_interval = self.config_manager.snapshot()["poll_interval"]
                     time.sleep(poll_interval)
 
@@ -479,25 +586,39 @@ class StreamManager:
                         call_had_audio = True
                     elif call_had_audio:
                         silence_duration = time.monotonic() - last_growth_time
-                        threshold = self.config_manager.snapshot()["ptt_end_silence_threshold"]
+                        threshold = self.config_manager.snapshot()[
+                            "ptt_end_silence_threshold"
+                        ]
                         if silence_duration >= threshold:
                             break
 
                 self.terminate_gstreamer(proc)
 
                 if self.shutdown_event.is_set() or self.reload_channels_event.is_set():
-                    if call_had_audio and os.path.exists(staging) and os.path.getsize(staging) > 0:
-                        self.persist_call_with_sender(name, call_start_dt, staging, call_sender_ip)
+                    if (
+                        call_had_audio
+                        and os.path.exists(staging)
+                        and os.path.getsize(staging) > 0
+                    ):
+                        self.persist_call_with_sender(
+                            name, call_start_dt, staging, call_sender_ip
+                        )
                     elif os.path.exists(staging):
                         os.remove(staging)
                     break
 
-                if not call_had_audio or not os.path.exists(staging) or os.path.getsize(staging) == 0:
+                if (
+                    not call_had_audio
+                    or not os.path.exists(staging)
+                    or os.path.getsize(staging) == 0
+                ):
                     if os.path.exists(staging):
                         os.remove(staging)
                     continue
 
-                self.persist_call_with_sender(name, call_start_dt, staging, call_sender_ip)
+                self.persist_call_with_sender(
+                    name, call_start_dt, staging, call_sender_ip
+                )
         finally:
             if sender_sock is not None:
                 try:
@@ -521,7 +642,10 @@ class StreamManager:
             print(f"\nERROR: '{gst_bin}' not found.")
             print("  - Confirm GStreamer is installed and its bin\\ folder is on PATH.")
             print("  - Or set gstreamer_bin in config.json to the full path.")
-            print("  - Current PATH:\n    " + "\n    ".join(os.environ.get("PATH", "").split(os.pathsep)))
+            print(
+                "  - Current PATH:\n    "
+                + "\n    ".join(os.environ.get("PATH", "").split(os.pathsep))
+            )
             raise SystemExit(1)
 
 
@@ -566,7 +690,9 @@ class RadioMonitorApp:
         target_path = service_path or (service_dir / "transcribe.service")
 
         default_python = service_dir / ".venv" / "bin" / "python"
-        python_executable = default_python if default_python.exists() else Path(sys.executable)
+        python_executable = (
+            default_python if default_python.exists() else Path(sys.executable)
+        )
         script_path = service_dir / "radio_monitor.py"
         config_path = service_dir / "config.json"
 
@@ -610,12 +736,14 @@ class RadioMonitorApp:
 
         print("=" * 60)
         print("  Radio Monitor - Starting")
-        print(f"  Script start time : {self.script_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(
+            f"  Script start time : {self.script_start_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
 
         os.makedirs(snap["recordings_base"], exist_ok=True)
         usage = shutil.disk_usage(snap["recordings_base"])
-        free_gb = usage.free / (1024 ** 3)
-        total_gb = usage.total / (1024 ** 3)
+        free_gb = usage.free / (1024**3)
+        total_gb = usage.total / (1024**3)
         print(f"  Disk space        : {free_gb:.1f} GB free / {total_gb:.1f} GB total")
 
         print(f"  Interface IP      : {snap['multicast_interface']}")
@@ -782,13 +910,17 @@ class RadioMonitorApp:
                     continue
 
                 if self.config_manager.snapshot()["channels"] != previous_channels:
-                    print("[Config] Channel list changed. Restarting channel monitor threads...")
+                    print(
+                        "[Config] Channel list changed. Restarting channel monitor threads..."
+                    )
                     self.restart_channel_threads()
 
                 self.reload_web_server_if_needed(previous_web_cfg)
 
                 with self.state_lock:
-                    self.last_reload_applied_at = datetime.datetime.now().isoformat(timespec="seconds")
+                    self.last_reload_applied_at = datetime.datetime.now().isoformat(
+                        timespec="seconds"
+                    )
 
                 print("[Config] Hot reload applied.")
 

@@ -34,19 +34,19 @@ def default_config_dict() -> dict[str, Any]:
     """Return a full default config dictionary."""
 
     return {
-    "multicast_interface": "10.3.1.253",
-    "gstreamer_bin": "gst-launch-1.0",
-    "recordings_base": "./recordings",
-    "logs_base": "./logs",
-    "ptt_end_silence_threshold": 2.0,
-    "poll_interval": 0.5,
-    "web_ui": {
-      "enabled": True,
-      "host": "0.0.0.0",
-      "port": 12345,
-    },
-    "channels": [dict(DEFAULT_CHANNEL)],
-  }
+        "multicast_interface": "10.3.1.253",
+        "gstreamer_bin": "gst-launch-1.0",
+        "recordings_base": "./recordings",
+        "logs_base": "./logs",
+        "ptt_end_silence_threshold": 2.0,
+        "poll_interval": 0.5,
+        "web_ui": {
+            "enabled": True,
+            "host": "0.0.0.0",
+            "port": 12345,
+        },
+        "channels": [dict(DEFAULT_CHANNEL)],
+    }
 
 
 def normalize_config(raw: dict[str, Any]) -> dict[str, Any]:
@@ -158,10 +158,10 @@ def validate_config_shape(raw: dict[str, Any]) -> None:
             raise ValueError(f"channels[{idx}].port must be in range 1..65535.")
 
 
-
-
 # HTTP response and file write utilities.
-def _json_response(handler: BaseHTTPRequestHandler, code: int, payload: dict[str, Any]) -> None:
+def _json_response(
+    handler: BaseHTTPRequestHandler, code: int, payload: dict[str, Any]
+) -> None:
     """Send a JSON response with explicit content headers."""
 
     data = json.dumps(payload, indent=2).encode("utf-8")
@@ -195,7 +195,13 @@ def _atomic_write(path: Path, content: str) -> None:
 class ConfigWebServer:
     """Serve config editor UI and REST endpoints."""
 
-    def __init__(self, config_path: Path, host: str, port: int, status_provider: Callable[[], dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        config_path: Path,
+        host: str,
+        port: int,
+        status_provider: Callable[[], dict[str, Any]] | None = None,
+    ) -> None:
         """Initialize server state and build HTTP handler."""
 
         self.config_path = config_path
@@ -222,8 +228,8 @@ class ConfigWebServer:
                     owner._handle_get_config(self)
                     return
                 if self.path == "/api/status":
-                  owner._handle_get_status(self)
-                  return
+                    owner._handle_get_status(self)
+                    return
                 if self.path == "/health":
                     _json_response(self, HTTPStatus.OK, {"status": "ok"})
                     return
@@ -691,9 +697,13 @@ class ConfigWebServer:
             with self._lock:
                 raw = self._read_raw()
         except Exception as exc:
-            _json_response(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            _json_response(
+                handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}
+            )
             return
-        _json_response(handler, HTTPStatus.OK, {"config": raw, "path": str(self.config_path)})
+        _json_response(
+            handler, HTTPStatus.OK, {"config": raw, "path": str(self.config_path)}
+        )
 
     def _handle_get_status(self, handler: BaseHTTPRequestHandler) -> None:
         """Return read-only runtime status payload as JSON."""
@@ -713,7 +723,9 @@ class ConfigWebServer:
                         "warning": "status provider returned non-object payload"
                     }
             except Exception as exc:
-                _json_response(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                _json_response(
+                    handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}
+                )
                 return
         _json_response(handler, HTTPStatus.OK, payload)
 
@@ -726,7 +738,9 @@ class ConfigWebServer:
         except ValueError:
             length = 0
         if length <= 0:
-            _json_response(handler, HTTPStatus.BAD_REQUEST, {"error": "Empty request body."})
+            _json_response(
+                handler, HTTPStatus.BAD_REQUEST, {"error": "Empty request body."}
+            )
             return
         body = handler.rfile.read(length)
         try:
@@ -743,7 +757,9 @@ class ConfigWebServer:
             with self._lock:
                 write_config(self.config_path, parsed)
         except Exception as exc:
-            _json_response(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            _json_response(
+                handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}
+            )
             return
 
         _json_response(
