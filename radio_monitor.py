@@ -137,7 +137,7 @@ class ConfigManager:
                     else self.DEFAULT_WINDOWS_MCAST_IFACE_IP
                 )
             case p if p.startswith("linux"):
-                return iface if (iface := self._get_linux_mcast_iface()) else "eth0"
+                return iface if (iface := self._get_linux_mcast_iface()) else "10.3.1.254"
             case p if p.startswith("darwin"):
                 return "en0"
             case _:
@@ -541,7 +541,8 @@ class StreamManager:
         """Create a nonblocking UDP listener to observe sender IPs on a channel multicast stream."""
         group_ip = channel["ip"]
         port = int(channel["port"])
-        iface_ip = self.config_manager.snapshot()["multicast_interface"]
+        iface_raw = str(self.config_manager.snapshot()["multicast_interface"]).strip()
+        iface_ip = self.resolve_membership_iface_ip(iface_raw)
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         try:
@@ -553,7 +554,16 @@ class StreamManager:
                 sock.bind((group_ip, port))
 
             mreq = socket.inet_aton(group_ip) + socket.inet_aton(iface_ip)
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            except OSError as exc:
+                # Linux can raise ENODEV when iface IP is not currently assigned.
+                # Retry with INADDR_ANY so kernel picks a valid multicast interface.
+                if exc.errno == 19 and iface_ip != "0.0.0.0":
+                    mreq_any = socket.inet_aton(group_ip) + socket.inet_aton("0.0.0.0")
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq_any)
+                else:
+                    raise
             sock.setblocking(False)
             return sock
         except OSError as exc:
@@ -564,41 +574,33 @@ class StreamManager:
                 pass
             return None
 
-    def ensure_sender_socket(
-        self,
-        channel: Channel,
-        sender_sock: socket.socket | None,
-        next_retry_at: float,
-    ) -> tuple[socket.socket | None, float]:
-        """Return a live sender socket when possible, retrying on a backoff timer."""
-        if sender_sock is not None:
-            return sender_sock, next_retry_at
+    def resolve_membership_iface_ip(self, iface_value: str) -> str:
+        """Return an IPv4 address suitable for IP_ADD_MEMBERSHIP interface field."""
+        if not iface_value:
+            return "0.0.0.0"
 
-        now = time.monotonic()
-        if now < next_retry_at:
-            return None, next_retry_at
+        try:
+            socket.inet_aton(iface_value)
+            return iface_value
+        except OSError:
+            pass
 
-        sender_sock = self.build_sender_socket(channel)
-        if sender_sock is None:
-            # Keep retrying if network/interface state recovers later.
-            return None, now + 5.0
-        return sender_sock, now
-
-    def poll_sender_ip(self, sender_sock: socket.socket | None) -> str | None:
-        """Drain available UDP packets and return the latest observed sender IP."""
-        if sender_sock is None:
-            return None
-
-        latest_ip = None
-        while True:
+        if sys.platform.lower().startswith("linux"):
             try:
-                _payload, (sender_ip, _sender_port) = sender_sock.recvfrom(4096)
-                latest_ip = sender_ip
-            except BlockingIOError:
-                break
-            except OSError:
-                break
-        return latest_ip
+                import netifaces
+
+                addrs = netifaces.ifaddresses(iface_value)
+                for addr_info in addrs.get(netifaces.AF_INET, []):
+                    ip_addr = str(addr_info.get("addr", "")).strip()
+                    if ip_addr:
+                        return ip_addr
+            except ImportError:
+                # netifaces is optional; fall back to INADDR_ANY.
+                pass
+            except Exception:
+                pass
+
+        return "0.0.0.0"
 
     def prepare_staging_file(self, channel_name: str, recordings_base: str) -> str:
         """Ensure channel output directory exists and staging file starts clean."""
@@ -654,9 +656,15 @@ class StreamManager:
             silence_threshold = snap["ptt_end_silence_threshold"]
             time.sleep(poll_interval)
 
-            sender_ip = self.poll_sender_ip(sender_sock)
-            if sender_ip:
-                call_sender_ip = sender_ip
+            if sender_sock is not None:
+                while True:
+                    try:
+                        _payload, (sender_ip, _sender_port) = sender_sock.recvfrom(4096)
+                        call_sender_ip = sender_ip
+                    except BlockingIOError:
+                        break
+                    except OSError:
+                        break
 
             try:
                 current_size = os.path.getsize(staging)
@@ -716,9 +724,15 @@ class StreamManager:
                 and not self.reload_channels_event.is_set()
             ):
                 try:
-                    sender_sock, next_sender_sock_retry_at = self.ensure_sender_socket(
-                        channel, sender_sock, next_sender_sock_retry_at
-                    )
+                    if sender_sock is None:
+                        now = time.monotonic()
+                        if now >= next_sender_sock_retry_at:
+                            sender_sock = self.build_sender_socket(channel)
+                            if sender_sock is None:
+                                # Keep retrying if network/interface state recovers later.
+                                next_sender_sock_retry_at = now + 5.0
+                            else:
+                                next_sender_sock_retry_at = now
 
                     runtime_settings = self.config_manager.snapshot()
                     recordings_base = runtime_settings["recordings_base"]
