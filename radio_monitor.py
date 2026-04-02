@@ -415,6 +415,34 @@ class StreamManager:
         runtime_settings: dict[str, Any],
     ) -> list[str]:
         """Build gst-launch command list from current runtime config and channel."""
+        if sys.platform.lower().startswith("linux"):
+            return [
+                runtime_settings["gstreamer_bin"],
+                '-e',
+                'udpsrc',
+                f'uri=udp://{channel["ip"]}:{channel["port"]}',
+                'multicast-iface=eth0', #TODO: make iface auto-detect or configurable
+                'caps=application/x-rtp,media=audio,encoding-name=OPUS,payload=112',
+                '!',
+                'queue',
+                '!',
+                'rtpopusdepay',
+                '!',
+                'queue',
+                '!',
+                'opusdec',
+                '!',
+                "queue",
+                "!",
+                "audioconvert",
+                "!",
+                "audioresample",
+                "!",
+                "wavenc",
+                "!",
+                "filesink",
+                f"location={output_path.replace(os.sep, '/')}",
+            ]
         return [
             runtime_settings["gstreamer_bin"],
             "-e",
