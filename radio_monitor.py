@@ -637,12 +637,13 @@ class StreamManager:
         self,
         staging: str,
         sender_sock: socket.socket | None,
-    ) -> tuple[bool, str]:
-        """Track growth/silence to detect call boundaries and latest sender IP."""
+    ) -> tuple[bool, str, datetime.datetime | None]:
+        """Track growth/silence and return call activity, sender IP, and first-audio time."""
         last_size = 0
         last_growth_time = time.monotonic()
         call_had_audio = False
         call_sender_ip = ""
+        first_audio_dt: datetime.datetime | None = None
 
         while (
             not self.shutdown_event.is_set()
@@ -665,13 +666,16 @@ class StreamManager:
             if current_size > last_size:
                 last_size = current_size
                 last_growth_time = time.monotonic()
+                if first_audio_dt is None:
+                    # Anchor call timing to first observed WAV growth, not process launch.
+                    first_audio_dt = datetime.datetime.now()
                 call_had_audio = True
             elif call_had_audio:
                 silence_duration = time.monotonic() - last_growth_time
                 if silence_duration >= silence_threshold:
                     break
 
-        return call_had_audio, call_sender_ip
+        return call_had_audio, call_sender_ip, first_audio_dt
 
     def finalize_or_discard_call(
         self,
@@ -720,7 +724,6 @@ class StreamManager:
                     recordings_base = runtime_settings["recordings_base"]
                     staging = self.prepare_staging_file(name, recordings_base)
 
-                    call_start_dt = datetime.datetime.now()
                     proc = self.start_call_process(
                         channel,
                         name,
@@ -730,10 +733,13 @@ class StreamManager:
                     if proc is None:
                         continue
 
-                    call_had_audio, call_sender_ip = self.monitor_call_activity(
+                    call_had_audio, call_sender_ip, first_audio_dt = self.monitor_call_activity(
                         staging,
                         sender_sock,
                     )
+
+                    # Fall back for safety; calls with no audio are discarded later.
+                    call_start_dt = first_audio_dt or datetime.datetime.now()
 
                     self.terminate_gstreamer(proc)
 
