@@ -3,13 +3,18 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import threading
+import zipfile
+from datetime import datetime
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import parse_qs, quote, urlparse
 
 
 # Web UI runtime settings used by the embedded server.
@@ -227,6 +232,12 @@ class ConfigWebServer:
                 if self.path == "/api/config":
                     owner._handle_get_config(self)
                     return
+                if self.path == "/api/recordings":
+                    owner._handle_get_recordings(self)
+                    return
+                if self.path.startswith("/api/download"):
+                    owner._handle_download(self)
+                    return
                 if self.path == "/api/status":
                     owner._handle_get_status(self)
                     return
@@ -236,12 +247,15 @@ class ConfigWebServer:
                 _json_response(self, HTTPStatus.NOT_FOUND, {"error": "Not Found"})
 
             def do_POST(self) -> None:  # noqa: N802
-                """Handle config update requests from the UI."""
+              """Handle config update requests from the UI."""
 
-                if self.path == "/api/config":
-                    owner._handle_post_config(self)
-                    return
-                _json_response(self, HTTPStatus.NOT_FOUND, {"error": "Not Found"})
+              if self.path == "/api/config":
+                owner._handle_post_config(self)
+                return
+              if self.path == "/api/download-batch":
+                owner._handle_download_batch(self)
+                return
+              _json_response(self, HTTPStatus.NOT_FOUND, {"error": "Not Found"})
 
             def log_message(self, format: str, *args: Any) -> None:
                 """Suppress default HTTP access logging."""
@@ -356,6 +370,28 @@ class ConfigWebServer:
       margin-bottom: 14px;
       background: #fbfcfa;
     }
+    .tab-bar {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+    }
+    .tab-btn {
+      border: 1px solid #bdd0c5;
+      border-radius: 999px;
+      padding: 7px 14px;
+      cursor: pointer;
+      background: #eef4ef;
+      color: #214249;
+      font-weight: 700;
+    }
+    .tab-btn.active {
+      color: #fff;
+      border-color: transparent;
+      background: linear-gradient(90deg, #0f6f66, #0f4f7c);
+    }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
     .group h2 { margin: 0 0 10px; font-size: 1rem; }
     .subhelp { margin: 0 0 10px; color: var(--muted); font-size: 0.85rem; }
     .grid {
@@ -403,6 +439,84 @@ class ConfigWebServer:
     button.warn { background: #7a2e2e; }
     #status { color: var(--muted); font-size: 0.9rem; }
     #status.error { color: var(--warn); }
+    .records-table-wrap {
+      width: 100%;
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #fff;
+    }
+    .records-table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 1040px;
+    }
+    .records-table th,
+    .records-table td {
+      padding: 8px;
+      border-bottom: 1px solid #edf2ee;
+      text-align: left;
+      font-size: 0.82rem;
+      vertical-align: top;
+      white-space: nowrap;
+    }
+    .records-table thead th {
+      position: sticky;
+      top: 0;
+      background: #eef4ef;
+      color: #23343a;
+      z-index: 1;
+    }
+    .records-empty {
+      padding: 14px;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+    .runtime-status {
+      margin: 0;
+      max-height: 260px;
+      overflow: auto;
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 0.82rem;
+    }
+    .recordings-toolbar {
+      margin-top: 0;
+      margin-bottom: 10px;
+    }
+    .recordings-status {
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+    .recordings-controls {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .recordings-controls .control {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .recordings-controls .control label {
+      margin-bottom: 0;
+      font-size: 0.78rem;
+      color: #4b5d66;
+    }
+    .recordings-status.error {
+      color: var(--warn);
+    }
+    .link-like {
+      color: #0f4f7c;
+      text-decoration: none;
+      font-weight: 600;
+    }
+    .link-like:hover {
+      text-decoration: underline;
+    }
     @media (max-width: 640px) {
       body { padding: 10px; }
       .body { padding: 12px; }
@@ -421,6 +535,12 @@ class ConfigWebServer:
       <p>Blank or missing config files are auto-created with defaults. Saved changes apply in about one second.</p>
     </header>
     <section class=\"body\">
+      <div class=\"tab-bar\" role=\"tablist\" aria-label=\"Main sections\">
+        <button id=\"tab-config\" class=\"tab-btn active\" type=\"button\" data-tab=\"config\" role=\"tab\" aria-selected=\"true\">Configuration</button>
+        <button id=\"tab-recordings\" class=\"tab-btn\" type=\"button\" data-tab=\"recordings\" role=\"tab\" aria-selected=\"false\">Recordings</button>
+      </div>
+
+      <section id=\"panel-config\" class=\"tab-panel active\" role=\"tabpanel\" aria-labelledby=\"tab-config\">
       <div class=\"group\">
         <h2>General</h2>
         <p class="subhelp">Hover any input to see a quick explanation.</p>
@@ -437,7 +557,7 @@ class ConfigWebServer:
       <div class="group">
         <h2>Runtime Status</h2>
         <p class="subhelp">Read-only live status from the running monitor process.</p>
-        <pre id="runtime-status" style="margin:0;max-height:260px;overflow:auto;background:#fff;border:1px solid var(--border);border-radius:8px;padding:10px;font-size:0.82rem;"></pre>
+        <pre id="runtime-status" class="runtime-status"></pre>
       </div>
 
       <div class=\"group\">
@@ -465,6 +585,57 @@ class ConfigWebServer:
         <button id=\"save\" type=\"button\">Save</button>
         <span id=\"status\"></span>
       </div>
+      </section>
+
+      <section id=\"panel-recordings\" class=\"tab-panel\" role=\"tabpanel\" aria-labelledby=\"tab-recordings\">
+        <div class=\"group\">
+          <h2>Recorded Calls</h2>
+          <p class=\"subhelp\">Flat view of all call rows found in CSV logs, with downloads for both WAV recordings and log files.</p>
+          <div class=\"row recordings-toolbar\">
+            <button id=\"refresh-recordings\" class=\"alt\" type=\"button\">Refresh List</button>
+            <button id=\"download-filtered-audio\" class=\"alt\" type=\"button\">Download All Audio</button>
+            <button id=\"download-filtered-csv\" class=\"alt\" type=\"button\">Download All CSVs</button>
+            <span id=\"recordings-status\" class=\"recordings-status\"></span>
+          </div>
+          <div class=\"recordings-controls\">
+            <div class=\"control\">
+              <label for=\"rec-filter-channel\">channel</label>
+              <select id=\"rec-filter-channel\">
+                <option value=\"\">all</option>
+              </select>
+            </div>
+            <div class=\"control\">
+              <label for=\"rec-filter-sender\">sender contains</label>
+              <input id=\"rec-filter-sender\" type=\"text\" placeholder=\"e.g. 10.3.1.\" />
+            </div>
+            <div class=\"control\">
+              <label for=\"rec-filter-search\">search filename</label>
+              <input id=\"rec-filter-search\" type=\"text\" placeholder=\"part of WAV/CSV name\" />
+            </div>
+            <div class=\"control\">
+              <label for=\"rec-sort-by\">sort by</label>
+              <select id=\"rec-sort-by\">
+                <option value=\"local_start_time\">local_start_time</option>
+                <option value=\"unique_id\">unique_id</option>
+                <option value=\"channel_name\">channel_name</option>
+                <option value=\"sender_ip\">sender_ip</option>
+                <option value=\"duration_seconds\">duration_seconds</option>
+                <option value=\"wav_filename\">wav_filename</option>
+              </select>
+            </div>
+            <div class=\"control\">
+              <label for=\"rec-sort-dir\">sort direction</label>
+              <select id=\"rec-sort-dir\">
+                <option value=\"desc\">desc</option>
+                <option value=\"asc\">asc</option>
+              </select>
+            </div>
+          </div>
+          <div id=\"recordings-container\" class=\"records-table-wrap\">
+            <div class=\"records-empty\">Loading recordings...</div>
+          </div>
+        </div>
+      </section>
     </section>
   </main>
 
@@ -483,11 +654,43 @@ class ConfigWebServer:
   </template>
 
   <script>
-    const statusEl = document.getElementById('status');
-    const serviceStatusBadgeEl = document.getElementById('service-status-badge');
-    const runtimeStatusEl = document.getElementById('runtime-status');
-    const channelsEl = document.getElementById('channels');
-    const channelTpl = document.getElementById('channel-template');
+    const el = id => document.getElementById(id);
+
+    const statusEl = el('status');
+    const serviceStatusBadgeEl = el('service-status-badge');
+    const runtimeStatusEl = el('runtime-status');
+    const recordingsContainerEl = el('recordings-container');
+    const recordingsStatusEl = el('recordings-status');
+    const recFilterChannelEl = el('rec-filter-channel');
+    const recFilterSenderEl = el('rec-filter-sender');
+    const recFilterSearchEl = el('rec-filter-search');
+    const recSortByEl = el('rec-sort-by');
+    const recSortDirEl = el('rec-sort-dir');
+    const downloadFilteredAudioEl = el('download-filtered-audio');
+    const downloadFilteredCsvEl = el('download-filtered-csv');
+    const formEls = {
+      multicastInterface: el('multicast_interface'),
+      gstreamerBin: el('gstreamer_bin'),
+      recordingsBase: el('recordings_base'),
+      logsBase: el('logs_base'),
+      silenceThreshold: el('ptt_end_silence_threshold'),
+      pollInterval: el('poll_interval'),
+      webEnabled: el('web_enabled'),
+      webHost: el('web_host'),
+      webPort: el('web_port'),
+      addChannel: el('add-channel'),
+      reload: el('reload'),
+      save: el('save'),
+      refreshRecordings: el('refresh-recordings'),
+    };
+
+    const tabButtons = Array.from(document.querySelectorAll('.tab-btn'));
+    const tabPanels = {
+      config: el('panel-config'),
+      recordings: el('panel-recordings'),
+    };
+    const channelsEl = el('channels');
+    const channelTpl = el('channel-template');
     const FIELD_HELP_BY_ID = {
       multicast_interface: 'Local interface/IP used for multicast join.',
       gstreamer_bin: 'Path to gst-launch-1.0 executable or command name on PATH.',
@@ -504,6 +707,27 @@ class ConfigWebServer:
       ip: 'Multicast group address for this channel.',
       port: 'UDP port for this channel.',
     };
+    const AUDIO_BUTTON_BASE = 'Download All Audio';
+    const CSV_BUTTON_BASE = 'Download All CSVs';
+    const RECORDING_VALUE_COLUMNS = [
+      'unique_id',
+      'channel_name',
+      'sender_ip',
+      'relative_start',
+      'relative_end',
+      'local_start_time',
+      'local_end_time',
+      'duration_seconds',
+      'wav_filename',
+    ];
+    const RECORDING_TABLE_HEADERS = [
+      ...RECORDING_VALUE_COLUMNS,
+      'recording',
+      'log_csv',
+    ];
+
+    let recordingsRows = [];
+    let filteredRecordingsRows = [];
 
     function applyTopLevelHelp() {
       Object.entries(FIELD_HELP_BY_ID).forEach(([id, help]) => {
@@ -514,9 +738,39 @@ class ConfigWebServer:
       });
     }
 
+    function updateBatchDownloadButtonLabels() {
+      const audioCount = filteredRecordingsRows.filter(row => !!row.recording_exists).length;
+      const csvCount = filteredRecordingsRows.filter(row => !!row.log_csv_path).length;
+
+      downloadFilteredAudioEl.textContent = `${AUDIO_BUTTON_BASE} (${audioCount})`;
+      downloadFilteredCsvEl.textContent = `${CSV_BUTTON_BASE} (${csvCount})`;
+      downloadFilteredAudioEl.disabled = audioCount === 0;
+      downloadFilteredCsvEl.disabled = csvCount === 0;
+    }
+
     function showStatus(msg, isError = false) {
       statusEl.textContent = msg;
       statusEl.className = isError ? 'error' : '';
+    }
+
+    function showRecordingsStatus(msg, isError = false) {
+      recordingsStatusEl.textContent = msg;
+      recordingsStatusEl.classList.toggle('error', isError);
+    }
+
+    function switchTab(tabName) {
+      tabButtons.forEach(btn => {
+        const active = btn.dataset.tab === tabName;
+        btn.classList.toggle('active', active);
+        btn.setAttribute('aria-selected', active ? 'true' : 'false');
+      });
+      Object.entries(tabPanels).forEach(([name, panel]) => {
+        panel.classList.toggle('active', name === tabName);
+      });
+
+      if (tabName === 'recordings') {
+        loadRecordings().catch(err => showRecordingsStatus(String(err), true));
+      }
     }
 
     function setServiceBadge(state, label) {
@@ -561,8 +815,8 @@ class ConfigWebServer:
       return Number.isFinite(n) ? n : fallback;
     }
 
-    function setSelect(id, value) {
-      document.getElementById(id).value = value ? 'true' : 'false';
+    function setSelect(selectEl, value) {
+      selectEl.value = value ? 'true' : 'false';
     }
 
     function addChannelCard(channel = {}) {
@@ -591,15 +845,15 @@ class ConfigWebServer:
     }
 
     function loadForm(cfg) {
-      document.getElementById('multicast_interface').value = cfg.multicast_interface || '';
-      document.getElementById('gstreamer_bin').value = cfg.gstreamer_bin || '';
-      document.getElementById('recordings_base').value = cfg.recordings_base || './recordings';
-      document.getElementById('logs_base').value = cfg.logs_base || './logs';
-      document.getElementById('ptt_end_silence_threshold').value = cfg.ptt_end_silence_threshold || 2.0;
-      document.getElementById('poll_interval').value = cfg.poll_interval || 0.5;
-      setSelect('web_enabled', !!(cfg.web_ui && cfg.web_ui.enabled));
-      document.getElementById('web_host').value = (cfg.web_ui && cfg.web_ui.host) || '0.0.0.0';
-      document.getElementById('web_port').value = (cfg.web_ui && cfg.web_ui.port) || 12345;
+      formEls.multicastInterface.value = cfg.multicast_interface || '';
+      formEls.gstreamerBin.value = cfg.gstreamer_bin || '';
+      formEls.recordingsBase.value = cfg.recordings_base || './recordings';
+      formEls.logsBase.value = cfg.logs_base || './logs';
+      formEls.silenceThreshold.value = cfg.ptt_end_silence_threshold || 2.0;
+      formEls.pollInterval.value = cfg.poll_interval || 0.5;
+      setSelect(formEls.webEnabled, !!(cfg.web_ui && cfg.web_ui.enabled));
+      formEls.webHost.value = (cfg.web_ui && cfg.web_ui.host) || '0.0.0.0';
+      formEls.webPort.value = (cfg.web_ui && cfg.web_ui.port) || 12345;
 
       channelsEl.innerHTML = '';
       const channels = Array.isArray(cfg.channels) && cfg.channels.length ? cfg.channels : [{}];
@@ -618,26 +872,267 @@ class ConfigWebServer:
     function readForm() {
       const cards = Array.from(channelsEl.querySelectorAll('.source'));
       return {
-        multicast_interface: document.getElementById('multicast_interface').value,
-        gstreamer_bin: document.getElementById('gstreamer_bin').value,
-        recordings_base: document.getElementById('recordings_base').value,
-        logs_base: document.getElementById('logs_base').value,
-        ptt_end_silence_threshold: numValue(document.getElementById('ptt_end_silence_threshold'), 2.0),
-        poll_interval: numValue(document.getElementById('poll_interval'), 0.5),
+        multicast_interface: formEls.multicastInterface.value,
+        gstreamer_bin: formEls.gstreamerBin.value,
+        recordings_base: formEls.recordingsBase.value,
+        logs_base: formEls.logsBase.value,
+        ptt_end_silence_threshold: numValue(formEls.silenceThreshold, 2.0),
+        poll_interval: numValue(formEls.pollInterval, 0.5),
         web_ui: {
-          enabled: boolValue(document.getElementById('web_enabled').value),
-          host: document.getElementById('web_host').value,
-          port: numValue(document.getElementById('web_port'), 12345),
+          enabled: boolValue(formEls.webEnabled.value),
+          host: formEls.webHost.value,
+          port: numValue(formEls.webPort, 12345),
         },
         channels: cards.map(readChannelCard),
       };
     }
 
+    function cellText(value) {
+      if (value === null || value === undefined || value === '') {
+        return '-';
+      }
+      return String(value);
+    }
+
+    function buildDownloadCell(url, label) {
+      const td = document.createElement('td');
+      if (!url) {
+        td.textContent = '-';
+        return td;
+      }
+      const a = document.createElement('a');
+      a.href = url;
+      a.textContent = label;
+      a.className = 'link-like';
+      td.appendChild(a);
+      return td;
+    }
+
+    function normalizeText(value) {
+      return String(value || '').toLowerCase();
+    }
+
+    function populateChannelFilter(rows) {
+      const previous = recFilterChannelEl.value;
+      const channels = Array.from(
+        new Set(
+          (rows || [])
+            .map(r => String(r.channel_name || '').trim())
+            .filter(Boolean)
+        )
+      ).sort((a, b) => a.localeCompare(b));
+
+      recFilterChannelEl.innerHTML = '<option value="">all</option>';
+      channels.forEach(channel => {
+        const opt = document.createElement('option');
+        opt.value = channel;
+        opt.textContent = channel;
+        recFilterChannelEl.appendChild(opt);
+      });
+
+      if (channels.includes(previous)) {
+        recFilterChannelEl.value = previous;
+      }
+    }
+
+    function sortRows(rows, sortBy, sortDir) {
+      const sorted = [...rows];
+      const direction = sortDir === 'asc' ? 1 : -1;
+      sorted.sort((a, b) => {
+        const av = a ? a[sortBy] : '';
+        const bv = b ? b[sortBy] : '';
+
+        if (sortBy === 'unique_id' || sortBy === 'duration_seconds') {
+          const an = Number(av);
+          const bn = Number(bv);
+          const aNum = Number.isFinite(an) ? an : Number.NEGATIVE_INFINITY;
+          const bNum = Number.isFinite(bn) ? bn : Number.NEGATIVE_INFINITY;
+          if (aNum === bNum) {
+            return 0;
+          }
+          return aNum > bNum ? direction : -direction;
+        }
+
+        const as = normalizeText(av);
+        const bs = normalizeText(bv);
+        const cmp = as.localeCompare(bs, undefined, { numeric: true, sensitivity: 'base' });
+        if (cmp === 0) {
+          return 0;
+        }
+        return cmp > 0 ? direction : -direction;
+      });
+      return sorted;
+    }
+
+    function applyRecordingsView() {
+      const channelFilter = String(recFilterChannelEl.value || '');
+      const senderFilter = normalizeText(recFilterSenderEl.value).trim();
+      const searchFilter = normalizeText(recFilterSearchEl.value).trim();
+      const sortBy = String(recSortByEl.value || 'local_start_time');
+      const sortDir = String(recSortDirEl.value || 'desc');
+
+      let rows = [...recordingsRows];
+      if (channelFilter) {
+        rows = rows.filter(row => String(row.channel_name || '') === channelFilter);
+      }
+      if (senderFilter) {
+        rows = rows.filter(row => normalizeText(row.sender_ip).includes(senderFilter));
+      }
+      if (searchFilter) {
+        rows = rows.filter(
+          row => normalizeText(row.wav_filename).includes(searchFilter)
+            || normalizeText(row.log_csv_path).includes(searchFilter)
+        );
+      }
+
+      const sortedRows = sortRows(rows, sortBy, sortDir);
+      filteredRecordingsRows = sortedRows;
+      renderRecordingsTable(sortedRows);
+      updateBatchDownloadButtonLabels();
+      showRecordingsStatus(
+        `Showing ${sortedRows.length} of ${recordingsRows.length} row${recordingsRows.length === 1 ? '' : 's'}`
+      );
+    }
+
+    function extractFilenameFromDisposition(contentDisposition) {
+      if (!contentDisposition) {
+        return '';
+      }
+      const match = contentDisposition.match(/filename="?([^";]+)"?/i);
+      return match ? match[1] : '';
+    }
+
+    async function fetchJson(url, options = undefined) {
+      const response = await fetch(url, options);
+      let data = {};
+      try {
+        data = await response.json();
+      } catch (_err) {
+        data = {};
+      }
+      return { response, data };
+    }
+
+    async function downloadFiltered(kind) {
+      const isRecording = kind === 'recording';
+      const paths = filteredRecordingsRows
+        .filter(row => (isRecording ? !!row.recording_exists : true))
+        .map(row => (isRecording ? row.recording_path : row.log_csv_path))
+        .filter(Boolean);
+
+      if (!paths.length) {
+        showRecordingsStatus(
+          isRecording ? 'No audio files in current filtered results.' : 'No CSV files in current filtered results.',
+          true
+        );
+        return;
+      }
+
+      showRecordingsStatus(
+        isRecording ? 'Preparing audio ZIP...' : 'Preparing CSV ZIP...'
+      );
+
+      const response = await fetch('/api/download-batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind, paths }),
+      });
+
+      if (!response.ok) {
+        let errorMessage = 'Batch download failed.';
+        try {
+          const payload = await response.json();
+          errorMessage = payload.error || errorMessage;
+        } catch (_err) {
+          // Keep fallback message when non-JSON error is returned.
+        }
+        showRecordingsStatus(errorMessage, true);
+        return;
+      }
+
+      const blob = await response.blob();
+      const disposition = response.headers.get('Content-Disposition');
+      const filename = extractFilenameFromDisposition(disposition)
+        || (isRecording ? 'audio_filtered.zip' : 'csv_filtered.zip');
+
+      const downloadUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(downloadUrl);
+
+      showRecordingsStatus(
+        isRecording ? `Downloaded ${paths.length} audio file(s).` : `Downloaded ${paths.length} CSV file(s).`
+      );
+    }
+
+    function renderRecordingsTable(rows) {
+      if (!Array.isArray(rows) || rows.length === 0) {
+        recordingsContainerEl.innerHTML = '<div class="records-empty">No recordings found yet.</div>';
+        return;
+      }
+
+      const wrap = document.createElement('div');
+      wrap.className = 'records-table-wrap';
+
+      const table = document.createElement('table');
+      table.className = 'records-table';
+
+      const thead = document.createElement('thead');
+      const headRow = document.createElement('tr');
+      RECORDING_TABLE_HEADERS.forEach(h => {
+        const th = document.createElement('th');
+        th.textContent = h;
+        headRow.appendChild(th);
+      });
+      thead.appendChild(headRow);
+
+      const tbody = document.createElement('tbody');
+      rows.forEach(row => {
+        const tr = document.createElement('tr');
+        RECORDING_VALUE_COLUMNS.forEach(key => {
+          const td = document.createElement('td');
+          td.textContent = cellText(row[key]);
+          tr.appendChild(td);
+        });
+
+        tr.appendChild(buildDownloadCell(row.recording_download_url, 'Download WAV'));
+        tr.appendChild(buildDownloadCell(row.log_csv_download_url, 'Download CSV'));
+        tbody.appendChild(tr);
+      });
+
+      table.appendChild(thead);
+      table.appendChild(tbody);
+      wrap.appendChild(table);
+
+      recordingsContainerEl.innerHTML = '';
+      recordingsContainerEl.appendChild(wrap);
+    }
+
+    async function loadRecordings() {
+      showRecordingsStatus('Loading recordings...');
+      const { response, data } = await fetchJson('/api/recordings');
+      if (!response.ok) {
+        recordingsRows = [];
+        filteredRecordingsRows = [];
+        updateBatchDownloadButtonLabels();
+        showRecordingsStatus(data.error || 'Failed to load recordings', true);
+        recordingsContainerEl.innerHTML = '<div class="records-empty">Failed to load recordings.</div>';
+        return;
+      }
+
+      recordingsRows = Array.isArray(data.rows) ? data.rows : [];
+      populateChannelFilter(recordingsRows);
+      applyRecordingsView();
+    }
+
     async function loadConfig() {
       showStatus('Loading...');
-      const r = await fetch('/api/config');
-      const data = await r.json();
-      if (!r.ok) {
+      const { response, data } = await fetchJson('/api/config');
+      if (!response.ok) {
         showStatus(data.error || 'Failed to load config', true);
         return;
       }
@@ -649,13 +1144,12 @@ class ConfigWebServer:
     async function saveConfig() {
       const payload = readForm();
       showStatus('Saving...');
-      const r = await fetch('/api/config', {
+      const { response, data } = await fetchJson('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const data = await r.json();
-      if (!r.ok) {
+      if (!response.ok) {
         showStatus(data.error || 'Save failed', true);
         return;
       }
@@ -665,9 +1159,8 @@ class ConfigWebServer:
     }
 
     async function loadRuntimeStatus() {
-      const r = await fetch('/api/status');
-      const data = await r.json();
-      if (!r.ok) {
+      const { response, data } = await fetchJson('/api/status');
+      if (!response.ok) {
         runtimeStatusEl.textContent = data.error || 'Failed to load runtime status';
         setServiceBadge('status-stopped', 'Stopped');
         return;
@@ -677,11 +1170,23 @@ class ConfigWebServer:
       setServiceBadge(badge.state, badge.label);
     }
 
-    document.getElementById('add-channel').addEventListener('click', () => addChannelCard({}));
-    document.getElementById('reload').addEventListener('click', () => loadConfig().catch(err => showStatus(String(err), true)));
-    document.getElementById('save').addEventListener('click', () => saveConfig().catch(err => showStatus(String(err), true)));
+    formEls.addChannel.addEventListener('click', () => addChannelCard({}));
+    formEls.reload.addEventListener('click', () => loadConfig().catch(err => showStatus(String(err), true)));
+    formEls.save.addEventListener('click', () => saveConfig().catch(err => showStatus(String(err), true)));
+    formEls.refreshRecordings.addEventListener('click', () => loadRecordings().catch(err => showRecordingsStatus(String(err), true)));
+    downloadFilteredAudioEl.addEventListener('click', () => downloadFiltered('recording').catch(err => showRecordingsStatus(String(err), true)));
+    downloadFilteredCsvEl.addEventListener('click', () => downloadFiltered('log').catch(err => showRecordingsStatus(String(err), true)));
+    [recFilterChannelEl, recFilterSenderEl, recFilterSearchEl, recSortByEl, recSortDirEl].forEach(el => {
+      el.addEventListener('input', applyRecordingsView);
+      el.addEventListener('change', applyRecordingsView);
+    });
+    tabButtons.forEach(btn => {
+      btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+    });
     applyTopLevelHelp();
+    updateBatchDownloadButtonLabels();
     setServiceBadge('status-unknown', 'Checking...');
+    switchTab('config');
     loadConfig().catch(err => showStatus(String(err), true));
     loadRuntimeStatus().catch(() => {});
     setInterval(() => loadRuntimeStatus().catch(() => {}), 3000);
@@ -728,6 +1233,246 @@ class ConfigWebServer:
                 )
                 return
         _json_response(handler, HTTPStatus.OK, payload)
+
+    def _resolve_data_roots(self) -> tuple[Path, Path]:
+        """Return absolute recordings and logs base directories from config."""
+
+        cfg = self._read_raw()
+        config_dir = self.config_path.parent.resolve()
+        recordings_base = cfg.get("recordings_base", "./recordings")
+        logs_base = cfg.get("logs_base", "./logs")
+
+        recordings_root = (config_dir / str(recordings_base)).resolve()
+        logs_root = (config_dir / str(logs_base)).resolve()
+        return recordings_root, logs_root
+
+    def _resolve_data_roots_threadsafe(self) -> tuple[Path, Path]:
+        """Resolve recordings/log roots under lock for thread-safe config reads."""
+
+        with self._lock:
+            return self._resolve_data_roots()
+
+    def _safe_child_path(self, root: Path, relative_path: str) -> Path:
+        """Resolve a user-supplied relative path under root or raise ValueError."""
+
+        if not relative_path.strip():
+            raise ValueError("Missing path.")
+
+        normalized = relative_path.replace("\\", "/").lstrip("/")
+        candidate = (root / normalized).resolve()
+        if not candidate.is_relative_to(root):
+            raise ValueError("Path is outside allowed directory.")
+        return candidate
+
+    @staticmethod
+    def _row_text(row: dict[str, Any], key: str) -> str:
+        """Return a stripped string value from a CSV row dict."""
+
+        return str(row.get(key, "")).strip()
+
+    @staticmethod
+    def _download_url(kind: str, rel_path: str) -> str:
+        """Build a download URL for a validated relative path."""
+
+        return f"/api/download?kind={kind}&path={quote(rel_path, safe='/')}"
+
+    def _recording_row_from_csv(
+        self,
+        csv_path: Path,
+        log_rel: str,
+        row: dict[str, Any],
+        recordings_root: Path,
+    ) -> dict[str, Any]:
+        """Build one recordings payload row from CSV metadata and file lookup."""
+
+        date_fragment = csv_path.parent.name
+        channel_name = self._row_text(row, "channel_name")
+        wav_filename = self._row_text(row, "wav_filename")
+
+        wav_rel = ""
+        wav_exists = False
+        if date_fragment and channel_name and wav_filename:
+            wav_rel = f"{date_fragment}/{channel_name}/{wav_filename}"
+            wav_path = (recordings_root / wav_rel).resolve()
+            wav_exists = wav_path.is_file() and wav_path.is_relative_to(recordings_root)
+
+        return {
+            "unique_id": self._row_text(row, "unique_id"),
+            "channel_name": channel_name,
+            "sender_ip": self._row_text(row, "sender_ip"),
+            "relative_start": self._row_text(row, "relative_start"),
+            "relative_end": self._row_text(row, "relative_end"),
+            "local_start_time": self._row_text(row, "local_start_time"),
+            "local_end_time": self._row_text(row, "local_end_time"),
+            "duration_seconds": self._row_text(row, "duration_seconds"),
+            "wav_filename": wav_filename,
+            "recording_path": wav_rel,
+            "recording_exists": wav_exists,
+            "recording_download_url": (
+                self._download_url("recording", wav_rel) if wav_exists else ""
+            ),
+            "log_csv_path": log_rel,
+            "log_csv_download_url": self._download_url("log", log_rel),
+        }
+
+    def _handle_get_recordings(self, handler: BaseHTTPRequestHandler) -> None:
+        """Return flattened recording rows derived from per-channel CSV logs."""
+
+        try:
+            recordings_root, logs_root = self._resolve_data_roots_threadsafe()
+            rows: list[dict[str, Any]] = []
+            if logs_root.exists():
+                for csv_path in sorted(logs_root.rglob("*.csv"), reverse=True):
+                    log_rel = csv_path.relative_to(logs_root).as_posix()
+                    try:
+                        with csv_path.open("r", newline="", encoding="utf-8") as fh:
+                            reader = csv.DictReader(fh)
+                            csv_rows = [
+                                self._recording_row_from_csv(
+                                    csv_path,
+                                    log_rel,
+                                    row,
+                                    recordings_root,
+                                )
+                                for row in reader
+                            ]
+                            rows.extend(reversed(csv_rows))
+                    except OSError:
+                        # Skip unreadable log files but keep the endpoint responsive.
+                        continue
+
+            _json_response(
+                handler,
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "recordings_base": str(recordings_root),
+                    "logs_base": str(logs_root),
+                    "count": len(rows),
+                    "rows": rows,
+                },
+            )
+        except Exception as exc:
+            _json_response(
+                handler,
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": str(exc)},
+            )
+
+    def _handle_download(self, handler: BaseHTTPRequestHandler) -> None:
+        """Serve files from recordings/log directories via validated relative paths."""
+
+        try:
+            parsed = urlparse(handler.path)
+            params = parse_qs(parsed.query)
+            kind = str(params.get("kind", [""])[0]).strip().lower()
+            rel_path = str(params.get("path", [""])[0]).strip()
+            if kind not in {"recording", "log"}:
+                raise ValueError("Invalid kind. Use 'recording' or 'log'.")
+
+            recordings_root, logs_root = self._resolve_data_roots_threadsafe()
+
+            root = recordings_root if kind == "recording" else logs_root
+            target = self._safe_child_path(root, rel_path)
+            if not target.exists() or not target.is_file():
+                _json_response(handler, HTTPStatus.NOT_FOUND, {"error": "Not Found"})
+                return
+
+            data = target.read_bytes()
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "application/octet-stream")
+            handler.send_header("Content-Length", str(len(data)))
+            handler.send_header(
+                "Content-Disposition", f'attachment; filename="{target.name}"'
+            )
+            handler.end_headers()
+            handler.wfile.write(data)
+        except ValueError as exc:
+            _json_response(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except Exception as exc:
+            _json_response(
+                handler,
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": str(exc)},
+            )
+
+    def _handle_download_batch(self, handler: BaseHTTPRequestHandler) -> None:
+        """Bundle filtered files into a ZIP archive and return as attachment."""
+
+        length_raw = handler.headers.get("Content-Length", "0")
+        try:
+            length = int(length_raw)
+        except ValueError:
+            length = 0
+
+        if length <= 0:
+            _json_response(
+                handler, HTTPStatus.BAD_REQUEST, {"error": "Empty request body."}
+            )
+            return
+
+        try:
+            body = handler.rfile.read(length)
+            payload = json.loads(body.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("JSON root must be an object.")
+
+            kind = str(payload.get("kind", "")).strip().lower()
+            if kind not in {"recording", "log"}:
+                raise ValueError("Invalid kind. Use 'recording' or 'log'.")
+
+            paths_raw = payload.get("paths")
+            if not isinstance(paths_raw, list):
+                raise ValueError("'paths' must be a JSON array.")
+
+            recordings_root, logs_root = self._resolve_data_roots_threadsafe()
+            root = recordings_root if kind == "recording" else logs_root
+
+            files: list[tuple[str, Path]] = []
+            seen: set[str] = set()
+            for item in paths_raw:
+                rel_path = str(item).strip()
+                if not rel_path or rel_path in seen:
+                    continue
+                seen.add(rel_path)
+                target = self._safe_child_path(root, rel_path)
+                if target.is_file():
+                    files.append((rel_path, target))
+
+            if not files:
+                _json_response(
+                    handler,
+                    HTTPStatus.NOT_FOUND,
+                    {"error": "No matching files found for download."},
+                )
+                return
+
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for rel_path, target in files:
+                    zf.write(target, arcname=rel_path.replace("\\", "/"))
+
+            data = zip_buffer.getvalue()
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            suffix = "audio" if kind == "recording" else "csv"
+            filename = f"{suffix}_filtered_{stamp}.zip"
+
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "application/zip")
+            handler.send_header("Content-Length", str(len(data)))
+            handler.send_header(
+                "Content-Disposition", f'attachment; filename="{filename}"'
+            )
+            handler.end_headers()
+            handler.wfile.write(data)
+        except ValueError as exc:
+            _json_response(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except Exception as exc:
+            _json_response(
+                handler,
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": str(exc)},
+            )
 
     def _handle_post_config(self, handler: BaseHTTPRequestHandler) -> None:
         """Validate and persist posted config payload."""
