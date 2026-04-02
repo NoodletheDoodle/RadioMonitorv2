@@ -13,3 +13,5 @@ venv/
 
 # service files
 *.service
+
+.env
