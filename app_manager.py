@@ -142,6 +142,15 @@ class RadioMonitorApp:
     def start_channel_threads(self) -> None:
         """Launch one monitor thread per configured channel."""
         channels = self.config_manager.snapshot()["channels"]
+        with self.call_counter_lock:
+            for channel in channels:
+                channel_name = channel["name"]
+                if channel_name in self.call_counters:
+                    continue
+                self.call_counters[channel_name] = self.csv_manager.recover_max_unique_id(
+                    channel_name
+                )
+
         threads: list[threading.Thread] = []
         for channel in channels:
             t = threading.Thread(
