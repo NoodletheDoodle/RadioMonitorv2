@@ -324,6 +324,18 @@
       border-color: #b7c9bd;
       background: #f8fbf8;
     }
+    .channel-color-picker {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+      border: 0;
+      padding: 0;
+      margin: 0;
+    }
     .channel-chip-swatch {
       width: 10px;
       height: 10px;
@@ -576,7 +588,7 @@
             <span class="channel-legend-help">Click a channel to choose a color</span>
           </div>
           <div id="channel-legend" class="channel-legend"></div>
-          <input id="channel-color-picker" type="color" style="position:absolute;left:-9999px;top:-9999px;" aria-hidden="true" tabindex="-1" />
+          <input id="channel-color-picker" class="channel-color-picker" type="color" />
           <div class="recordings-controls">
             <div class="control">
               <label for="rec-filter-channel">channel</label>
@@ -784,6 +796,31 @@
       } catch (_err) {
         customChannelColors = {};
       }
+    }
+
+    function openColorPickerForChannel(channelName) {
+      channelNameForColorPick = channelName;
+      channelColorPickerEl.value = getChannelBaseColor(channelName);
+      try {
+        if (typeof channelColorPickerEl.showPicker === 'function') {
+          channelColorPickerEl.showPicker();
+          return;
+        }
+      } catch (_err) {
+        // Fall through to click()-based picker opening.
+      }
+      channelColorPickerEl.focus({ preventScroll: true });
+      channelColorPickerEl.click();
+    }
+
+    function applyPickedChannelColor() {
+      if (!channelNameForColorPick) {
+        return;
+      }
+      customChannelColors[channelNameForColorPick] = channelColorPickerEl.value;
+      saveChannelColors();
+      updateChannelLegend(filteredRecordingsRows);
+      renderRecordingsTable(filteredRecordingsRows);
     }
 
     function applyTopLevelHelp() {
@@ -1102,9 +1139,7 @@
         chip.appendChild(swatch);
         chip.appendChild(text);
         chip.addEventListener('click', () => {
-          channelNameForColorPick = name;
-          channelColorPickerEl.value = getChannelBaseColor(name);
-          channelColorPickerEl.click();
+          openColorPickerForChannel(name);
         });
         channelLegendEl.appendChild(chip);
       });
@@ -1412,15 +1447,8 @@
     tabButtons.forEach(btn => {
       btn.addEventListener('click', () => switchTab(btn.dataset.tab));
     });
-    channelColorPickerEl.addEventListener('input', () => {
-      if (!channelNameForColorPick) {
-        return;
-      }
-      customChannelColors[channelNameForColorPick] = channelColorPickerEl.value;
-      saveChannelColors();
-      updateChannelLegend(filteredRecordingsRows);
-      renderRecordingsTable(filteredRecordingsRows);
-    });
+    channelColorPickerEl.addEventListener('input', applyPickedChannelColor);
+    channelColorPickerEl.addEventListener('change', applyPickedChannelColor);
     loadChannelColors();
     initCollapsibleGroups();
     applyTopLevelHelp();
