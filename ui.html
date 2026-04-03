@@ -208,12 +208,22 @@
     }
     .records-table th,
     .records-table td {
-      padding: 8px;
+      padding: 6px 7px;
       border-bottom: 1px solid #edf2ee;
       text-align: left;
-      font-size: 0.82rem;
+      font-size: 0.76rem;
+      line-height: 1.2;
       vertical-align: top;
       white-space: nowrap;
+    }
+    .records-table tbody tr:nth-child(odd) {
+      background: #fcfefc;
+    }
+    .records-table tbody tr:nth-child(even) {
+      background: #e7f0e9;
+    }
+    .records-table tbody tr:hover {
+      background: #ecf5ef;
     }
     .records-table thead th {
       position: sticky;
@@ -221,6 +231,105 @@
       background: #eef4ef;
       color: #23343a;
       z-index: 1;
+    }
+    .records-table th.files-col,
+    .records-table td.files-col {
+      position: sticky;
+      right: 0;
+      z-index: 2;
+      background: #edf5ef;
+      border-left: 1px solid #d8e5da;
+      min-width: 120px;
+    }
+    .records-table thead th.files-col {
+      z-index: 3;
+      background: #e3efe6;
+    }
+    .file-actions {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+    }
+    .file-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 44px;
+      padding: 3px 6px;
+      border-radius: 6px;
+      font-size: 0.68rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      border: 1px solid #3b6b8a;
+      background: #0f4f7c;
+      color: #fff;
+      text-decoration: none;
+      line-height: 1;
+    }
+    .file-btn:hover {
+      background: #0d456c;
+    }
+    .file-btn.disabled {
+      border-color: #c7d2d8;
+      background: #eef2f4;
+      color: #74848d;
+      pointer-events: none;
+    }
+    .channel-cell {
+      border-radius: 6px;
+      padding: 2px 6px;
+      font-weight: 700;
+      display: inline-block;
+      border: 1px solid transparent;
+    }
+    .channel-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 8px;
+      margin-bottom: 4px;
+    }
+    .channel-legend-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 8px;
+      margin-bottom: 6px;
+    }
+    .channel-legend-title {
+      font-size: 0.78rem;
+      color: #445760;
+      letter-spacing: 0.01em;
+      font-weight: 700;
+    }
+    .channel-legend-help {
+      font-size: 0.74rem;
+      color: #65757d;
+    }
+    .channel-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 999px;
+      border: 1px solid #d4e0d7;
+      background: #fff;
+      padding: 4px 8px;
+      font-size: 0.75rem;
+      color: #32454d;
+      cursor: pointer;
+      user-select: none;
+    }
+    .channel-chip:hover {
+      border-color: #b7c9bd;
+      background: #f8fbf8;
+    }
+    .channel-chip-swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      border: 1px solid rgba(0, 0, 0, 0.15);
+      flex: 0 0 10px;
     }
     .records-empty {
       padding: 14px;
@@ -462,6 +571,12 @@
             <button id="download-filtered-csv" class="alt" type="button">Download All CSVs</button>
             <span id="recordings-status" class="recordings-status"></span>
           </div>
+          <div class="channel-legend-head">
+            <span class="channel-legend-title">Channel Colors</span>
+            <span class="channel-legend-help">Click a channel to choose a color</span>
+          </div>
+          <div id="channel-legend" class="channel-legend"></div>
+          <input id="channel-color-picker" type="color" style="position:absolute;left:-9999px;top:-9999px;" aria-hidden="true" tabindex="-1" />
           <div class="recordings-controls">
             <div class="control">
               <label for="rec-filter-channel">channel</label>
@@ -531,6 +646,8 @@
     const networkRoutesEl = el('network-routes');
     const recordingsContainerEl = el('recordings-container');
     const recordingsStatusEl = el('recordings-status');
+    const channelLegendEl = el('channel-legend');
+    const channelColorPickerEl = el('channel-color-picker');
     const recFilterChannelEl = el('rec-filter-channel');
     const recFilterSenderEl = el('rec-filter-sender');
     const recFilterSearchEl = el('rec-filter-search');
@@ -592,12 +709,82 @@
     ];
     const RECORDING_TABLE_HEADERS = [
       ...RECORDING_VALUE_COLUMNS,
-      'recording',
-      'log_csv',
+      'files',
     ];
 
     let recordingsRows = [];
     let filteredRecordingsRows = [];
+    let customChannelColors = {};
+    let channelNameForColorPick = '';
+    const CHANNEL_COLOR_STORAGE_KEY = 'radio-monitor-channel-colors';
+    const GOOGLE_LIKE_PALETTE = [
+      '#4285F4', // blue
+      '#34A853', // green
+      '#FBBC05', // yellow
+      '#EA4335', // red
+      '#46BDC6', // cyan
+      '#AB47BC', // purple
+      '#FF7043', // deep orange
+      '#9AA0A6', // gray
+    ];
+
+    function hexToRgb(hex) {
+      const raw = String(hex || '').replace('#', '').trim();
+      if (raw.length !== 6) {
+        return { r: 66, g: 133, b: 244 };
+      }
+      return {
+        r: parseInt(raw.slice(0, 2), 16),
+        g: parseInt(raw.slice(2, 4), 16),
+        b: parseInt(raw.slice(4, 6), 16),
+      };
+    }
+
+    function getDefaultChannelColor(channelName) {
+      const allNames = Array.from(
+        new Set(
+          (recordingsRows || [])
+            .map(r => String(r.channel_name || '').trim())
+            .filter(Boolean)
+        )
+      ).sort((a, b) => a.localeCompare(b));
+
+      const idx = Math.max(0, allNames.indexOf(channelName));
+      return GOOGLE_LIKE_PALETTE[idx % GOOGLE_LIKE_PALETTE.length];
+    }
+
+    function getChannelBaseColor(channelName) {
+      const custom = customChannelColors[channelName];
+      return custom || getDefaultChannelColor(channelName);
+    }
+
+    function getChannelTheme(channelName) {
+      const base = getChannelBaseColor(channelName);
+      const { r, g, b } = hexToRgb(base);
+      return {
+        swatch: base,
+        bg: `rgba(${r}, ${g}, ${b}, 0.20)`,
+        border: `rgba(${r}, ${g}, ${b}, 0.55)`,
+        text: `rgb(${Math.max(20, Math.round(r * 0.35))}, ${Math.max(20, Math.round(g * 0.35))}, ${Math.max(20, Math.round(b * 0.35))})`,
+      };
+    }
+
+    function saveChannelColors() {
+      try {
+        localStorage.setItem(CHANNEL_COLOR_STORAGE_KEY, JSON.stringify(customChannelColors));
+      } catch (_err) {
+        // Best effort only.
+      }
+    }
+
+    function loadChannelColors() {
+      try {
+        const raw = localStorage.getItem(CHANNEL_COLOR_STORAGE_KEY);
+        customChannelColors = raw ? JSON.parse(raw) : {};
+      } catch (_err) {
+        customChannelColors = {};
+      }
+    }
 
     function applyTopLevelHelp() {
       Object.entries(FIELD_HELP_BY_ID).forEach(([id, help]) => {
@@ -870,18 +1057,57 @@
       return String(value);
     }
 
-    function buildDownloadCell(url, label) {
-      const td = document.createElement('td');
-      if (!url) {
-        td.textContent = '-';
-        return td;
-      }
+    function buildFileButton(url, label) {
       const a = document.createElement('a');
-      a.href = url;
-      a.textContent = label;
-      a.className = 'link-like';
-      td.appendChild(a);
-      return td;
+      if (url) {
+        a.href = url;
+        a.textContent = label;
+        a.className = 'file-btn';
+      } else {
+        a.textContent = label;
+        a.className = 'file-btn disabled';
+      }
+      return a;
+    }
+
+    function updateChannelLegend(rows) {
+      const names = Array.from(
+        new Set(
+          (rows || [])
+            .map(r => String(r.channel_name || '').trim())
+            .filter(Boolean)
+        )
+      ).sort((a, b) => a.localeCompare(b));
+
+      channelLegendEl.innerHTML = '';
+      if (!names.length) {
+        return;
+      }
+
+      names.forEach(name => {
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'channel-chip';
+        chip.title = `Set color for ${name}`;
+
+        const swatch = document.createElement('span');
+        swatch.className = 'channel-chip-swatch';
+        const color = getChannelTheme(name);
+        swatch.style.background = color.swatch;
+        swatch.style.borderColor = color.swatch;
+
+        const text = document.createElement('span');
+        text.textContent = name;
+
+        chip.appendChild(swatch);
+        chip.appendChild(text);
+        chip.addEventListener('click', () => {
+          channelNameForColorPick = name;
+          channelColorPickerEl.value = getChannelBaseColor(name);
+          channelColorPickerEl.click();
+        });
+        channelLegendEl.appendChild(chip);
+      });
     }
 
     function normalizeText(value) {
@@ -964,6 +1190,7 @@
       const sortedRows = sortRows(rows, sortBy, sortDir);
       filteredRecordingsRows = sortedRows;
       renderRecordingsTable(sortedRows);
+      updateChannelLegend(sortedRows);
       updateBatchDownloadButtonLabels();
       showRecordingsStatus(
         `Showing ${sortedRows.length} of ${recordingsRows.length} row${recordingsRows.length === 1 ? '' : 's'}`
@@ -1071,14 +1298,39 @@
         const tr = document.createElement('tr');
         RECORDING_VALUE_COLUMNS.forEach(key => {
           const td = document.createElement('td');
-          td.textContent = cellText(row[key]);
+          if (key === 'channel_name') {
+            const badge = document.createElement('span');
+            badge.className = 'channel-cell';
+            const channelName = cellText(row[key]);
+            badge.textContent = channelName;
+            if (channelName !== '-') {
+              const color = getChannelTheme(channelName);
+              badge.style.background = color.bg;
+              badge.style.borderColor = color.border;
+              badge.style.color = color.text;
+            }
+            td.appendChild(badge);
+          } else {
+            td.textContent = cellText(row[key]);
+          }
           tr.appendChild(td);
         });
 
-        tr.appendChild(buildDownloadCell(row.recording_download_url, 'Download WAV'));
-        tr.appendChild(buildDownloadCell(row.log_csv_download_url, 'Download CSV'));
+        const filesTd = document.createElement('td');
+        filesTd.className = 'files-col';
+        const actions = document.createElement('div');
+        actions.className = 'file-actions';
+        actions.appendChild(buildFileButton(row.recording_download_url, 'WAV'));
+        actions.appendChild(buildFileButton(row.log_csv_download_url, 'CSV'));
+        filesTd.appendChild(actions);
+        tr.appendChild(filesTd);
         tbody.appendChild(tr);
       });
+
+      const fileHeader = headRow.lastChild;
+      if (fileHeader) {
+        fileHeader.classList.add('files-col');
+      }
 
       table.appendChild(thead);
       table.appendChild(tbody);
@@ -1160,14 +1412,22 @@
     tabButtons.forEach(btn => {
       btn.addEventListener('click', () => switchTab(btn.dataset.tab));
     });
+    channelColorPickerEl.addEventListener('input', () => {
+      if (!channelNameForColorPick) {
+        return;
+      }
+      customChannelColors[channelNameForColorPick] = channelColorPickerEl.value;
+      saveChannelColors();
+      updateChannelLegend(filteredRecordingsRows);
+      renderRecordingsTable(filteredRecordingsRows);
+    });
+    loadChannelColors();
     initCollapsibleGroups();
     applyTopLevelHelp();
     updateBatchDownloadButtonLabels();
     setServiceBadge('status-unknown', 'Checking...');
     switchTab('config');
     loadConfig().catch(err => showStatus(String(err), true));
-    loadRuntimeStatus().catch(() => {});
-    loadNetworkStatus().catch(() => {});
     setInterval(() => loadRuntimeStatus().catch(() => {}), 3000);
     setInterval(() => loadNetworkStatus().catch(() => {}), 6000);
   </script>
